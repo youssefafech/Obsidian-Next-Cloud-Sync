@@ -1,7 +1,7 @@
 {
   "id": "sync-nextcloud-webdav",
   "name": "Nextcloud Sync Suite",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "minAppVersion": "1.4.0",
   "description": "Obsidian Nextcloud sync plugin with bedav file sync, task syncs and encrypted settings",
   "author": "Youssef Abou Afach",
