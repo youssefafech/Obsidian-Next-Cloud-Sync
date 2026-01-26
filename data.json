@@ -1,0 +1,34 @@
+{
+  "settings": {
+    "nextcloudBaseUrl": "",
+    "username": "",
+    "appPassword": "",
+    "remoteRoot": "Notes",
+    "debounceMs": 900,
+    "includePatterns": "**/*.md",
+    "excludePatterns": "",
+    "syncOnModify": true,
+    "syncOnFileClose": true,
+    "checkRemoteOnOpen": true,
+    "checkRemoteOnFocus": true,
+    "focusCheckThrottleMs": 2000,
+    "promptRemoteDelete": true,
+    "applyRemoteDeletions": true,
+    "remoteDeletionsPath": ".sync-deletions.json",
+    "enableTaskSync": true,
+    "taskListUrl": "",
+    "caldavBaseUrl": "",
+    "taskSyncOnFileSync": true,
+    "enableChangelog": false,
+    "changelogPath": "Sync Changelog.md",
+    "enableDebug": false,
+    "archiveConflictsOnResolve": true,
+    "conflictArchiveFolder": "Sync Conflicts",
+    "conflictArchiveRemoteFolder": ".sync-conflicts"
+  },
+  "state": {
+    "files": {
+      
+    }
+  }
+}

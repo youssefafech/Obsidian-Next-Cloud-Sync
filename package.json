@@ -1,0 +1,14 @@
+{
+  "name": "Sync",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "build": "esbuild main.ts --bundle --external:obsidian --outfile=main.js --format=cjs --platform=browser",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "private": true,
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

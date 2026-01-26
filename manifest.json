@@ -1,0 +1,11 @@
+{
+  "id": "sync-nextcloud-webdav",
+  "name": "Nextcloud Sync Suite",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sync Markdown files to a Nextcloud WebDAV server on save or manual command.",
+  "author": "Youssef Abou Afach",
+  "authorUrl": "https://youssefafech.dk",
+  "isDesktopOnly": false,
+  "main": "main.js"
+}
