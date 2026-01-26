@@ -3,7 +3,7 @@
   "name": "Nextcloud Sync Suite",
   "version": "0.1.0",
   "minAppVersion": "1.4.0",
-  "description": "Sync Markdown files to a Nextcloud WebDAV server on save or manual command.",
+  "description": "Obsidian Nextcloud sync plugin with bedav file sync, task syncs and encrypted settings",
   "author": "Youssef Abou Afach",
   "authorUrl": "https://youssefafech.dk",
   "isDesktopOnly": false,
