@@ -12,6 +12,14 @@ export type WebDavVersionEntry = {
   size: number | null;
 };
 
+export type WebDavListEntry = {
+  path: string;
+  etag: string | null;
+  lastModified: string | null;
+  contentType: string | null;
+  isCollection: boolean;
+};
+
 export type WebDavResponse = {
   ok: boolean;
   status: number;
@@ -84,6 +92,19 @@ export class WebDavClient {
     return this.baseUrl + encodePath(normalized);
   }
 
+  private toRemotePathFromHref(href: string): string | null {
+    try {
+      const base = new URL(this.baseUrl);
+      const hrefUrl = new URL(href, base);
+      const basePath = base.pathname.replace(/\/+$/, "") + "/";
+      if (!hrefUrl.pathname.startsWith(basePath)) return null;
+      const relative = hrefUrl.pathname.slice(basePath.length);
+      return decodeURIComponent(relative);
+    } catch {
+      return null;
+    }
+  }
+
   private async propfindDocument(url: string, depth: string, body: string): Promise<Document> {
     const response = await requestWithTimeout(url, {
       method: "PROPFIND",
@@ -122,6 +143,54 @@ export class WebDavClient {
     };
   }
 
+  async list(remotePath: string, depth = "1"): Promise<WebDavListEntry[]> {
+    const body = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getetag />
+    <d:getlastmodified />
+    <d:getcontenttype />
+    <d:resourcetype />
+  </d:prop>
+</d:propfind>`;
+    const xml = await this.propfindDocument(this.buildUrl(remotePath), depth, body);
+    const responses = Array.from(xml.getElementsByTagName("response"));
+    const entries: WebDavListEntry[] = [];
+    for (const responseEl of responses) {
+      const href = responseEl.querySelector("href")?.textContent?.trim();
+      if (!href) continue;
+      const path = this.toRemotePathFromHref(href);
+      if (!path) continue;
+
+      let propEl: Element | null = null;
+      const propstats = Array.from(responseEl.getElementsByTagName("propstat"));
+      for (const propstat of propstats) {
+        const status = propstat.querySelector("status")?.textContent ?? "";
+        if (status.includes(" 200 ")) {
+          propEl = propstat.querySelector("prop");
+          break;
+        }
+      }
+      if (!propEl) {
+        propEl = responseEl.querySelector("prop");
+      }
+
+      const etag = propEl?.querySelector("getetag")?.textContent ?? null;
+      const lastModified = propEl?.querySelector("getlastmodified")?.textContent ?? null;
+      const contentType = propEl?.querySelector("getcontenttype")?.textContent ?? null;
+      const isCollection = !!propEl?.querySelector("resourcetype > collection");
+
+      entries.push({
+        path,
+        etag,
+        lastModified,
+        contentType,
+        isCollection,
+      });
+    }
+    return entries;
+  }
+
   async propfindFileId(remotePath: string): Promise<string | null> {
     const body = `<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
@@ -143,6 +212,16 @@ export class WebDavClient {
       method: "GET",
       headers: {
         Authorization: this.authHeader,
+      },
+    });
+  }
+
+  async deleteAbsolute(url: string, headers: Record<string, string> = {}): Promise<WebDavResponse> {
+    return requestWithTimeout(url, {
+      method: "DELETE",
+      headers: {
+        Authorization: this.authHeader,
+        ...headers,
       },
     });
   }

@@ -68,6 +68,18 @@ var WebDavClient = class {
     const normalized = remotePath.replace(/^\/+/, "");
     return this.baseUrl + encodePath(normalized);
   }
+  toRemotePathFromHref(href) {
+    try {
+      const base = new URL(this.baseUrl);
+      const hrefUrl = new URL(href, base);
+      const basePath = base.pathname.replace(/\/+$/, "") + "/";
+      if (!hrefUrl.pathname.startsWith(basePath)) return null;
+      const relative = hrefUrl.pathname.slice(basePath.length);
+      return decodeURIComponent(relative);
+    } catch {
+      return null;
+    }
+  }
   async propfindDocument(url, depth, body) {
     const response = await requestWithTimeout(url, {
       method: "PROPFIND",
@@ -101,6 +113,50 @@ var WebDavClient = class {
       lastModified: mtimeNode?.textContent ?? null
     };
   }
+  async list(remotePath, depth = "1") {
+    const body = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getetag />
+    <d:getlastmodified />
+    <d:getcontenttype />
+    <d:resourcetype />
+  </d:prop>
+</d:propfind>`;
+    const xml = await this.propfindDocument(this.buildUrl(remotePath), depth, body);
+    const responses = Array.from(xml.getElementsByTagName("response"));
+    const entries = [];
+    for (const responseEl of responses) {
+      const href = responseEl.querySelector("href")?.textContent?.trim();
+      if (!href) continue;
+      const path = this.toRemotePathFromHref(href);
+      if (!path) continue;
+      let propEl = null;
+      const propstats = Array.from(responseEl.getElementsByTagName("propstat"));
+      for (const propstat of propstats) {
+        const status = propstat.querySelector("status")?.textContent ?? "";
+        if (status.includes(" 200 ")) {
+          propEl = propstat.querySelector("prop");
+          break;
+        }
+      }
+      if (!propEl) {
+        propEl = responseEl.querySelector("prop");
+      }
+      const etag = propEl?.querySelector("getetag")?.textContent ?? null;
+      const lastModified = propEl?.querySelector("getlastmodified")?.textContent ?? null;
+      const contentType = propEl?.querySelector("getcontenttype")?.textContent ?? null;
+      const isCollection = !!propEl?.querySelector("resourcetype > collection");
+      entries.push({
+        path,
+        etag,
+        lastModified,
+        contentType,
+        isCollection
+      });
+    }
+    return entries;
+  }
   async propfindFileId(remotePath) {
     const body = `<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
@@ -120,6 +176,15 @@ var WebDavClient = class {
       method: "GET",
       headers: {
         Authorization: this.authHeader
+      }
+    });
+  }
+  async deleteAbsolute(url, headers = {}) {
+    return requestWithTimeout(url, {
+      method: "DELETE",
+      headers: {
+        Authorization: this.authHeader,
+        ...headers
       }
     });
   }
@@ -215,6 +280,30 @@ var DEFAULT_SETTINGS = {
   focusCheckThrottleMs: 2e3,
   periodicRemoteCheckEnabled: false,
   periodicRemoteCheckMinutes: 15,
+  periodicRemoteCheckNotices: false,
+  taskSyncIntervalEnabled: false,
+  taskSyncIntervalMinutes: 10,
+  taskInboxEnabled: false,
+  taskInboxPath: "Task Inbox.md",
+  taskInboxQuery: "```tasks\nnot done\n```",
+  taskInboxAutoMove: true,
+  taskInboxArchivePath: "Task Inbox closed.md",
+  taskDeletionPromptEnabled: true,
+  taskDeletionDefaultAction: "keep",
+  todayNoteEnabled: true,
+  todayNotePath: "Today.md",
+  todayNoteLimit: 4,
+  todayNoteUseQuery: true,
+  todayNoteQuery: "```tasks\nnot done\nlimit {{limit}}\nsort by due\n```",
+  remindersEnabled: true,
+  remindersMinutes: 60,
+  remindersMode: "both",
+  remindersMaxCount: 3,
+  dailyChecklistEnabled: false,
+  dailyChecklistPath: "Daily Checklist.md",
+  dailyChecklistTemplate: "- [ ] Plan top 3 tasks\n- [ ] Take a short break\n- [ ] Review today",
+  quickCapturePath: "Task Inbox.md",
+  focusTag: "focus",
   promptRemoteDelete: true,
   applyRemoteDeletions: true,
   remoteDeletionsPath: ".sync-deletions.json",
@@ -235,28 +324,42 @@ var EMPTY_STATE = {
   files: {},
   conflicts: {},
   deletionsApplied: {},
-  tasks: {}
+  tasks: {},
+  noSync: {},
+  noTaskSync: {},
+  lastChecklistDate: null
 };
 var SyncPlugin = class extends import_obsidian2.Plugin {
   settings = { ...DEFAULT_SETTINGS };
   state = { ...EMPTY_STATE };
   statusBarItem = null;
+  currentStatus = "idle";
   queue = [];
   queuedPaths = /* @__PURE__ */ new Set();
   queueRunning = false;
   debounceTimers = /* @__PURE__ */ new Map();
+  taskDebounceTimers = /* @__PURE__ */ new Map();
   suppressModifyForPaths = /* @__PURE__ */ new Set();
   lastActiveFile = null;
   currentSyncPath = null;
+  progressActive = false;
+  progressTotal = 0;
+  progressDone = 0;
   logEntries = [];
   logLimit = 200;
   lastFocusChecks = /* @__PURE__ */ new Map();
   previewFiles = /* @__PURE__ */ new Set();
   fileStatuses = /* @__PURE__ */ new Map();
   deletionSyncInFlight = false;
+  periodicSyncInFlight = false;
+  lockStatusPath = false;
+  pausePeriodic = false;
   suppressDeletePrompt = /* @__PURE__ */ new Set();
+  suppressTaskDeletePrompt = /* @__PURE__ */ new Set();
   credentialKeyPromise = null;
   periodicSyncTimer = null;
+  taskSyncTimer = null;
+  reminderTimer = null;
   async onload() {
     await this.loadPluginData();
     this.addSettingTab(new SyncSettingTab(this.app, this));
@@ -264,8 +367,13 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     this.setStatus("idle");
     this.seedStatusesFromState();
     this.applyStatusStyles();
+    this.registerTaskIdIconProcessor();
     void this.syncRemoteDeletions("startup");
     this.setupPeriodicRemoteCheck();
+    this.setupTaskSyncInterval();
+    this.setupReminders();
+    void this.refreshTodayNote();
+    void this.refreshDailyChecklist();
     this.registerEvent(
       this.app.vault.on("modify", (file) => this.onVaultModify(file))
     );
@@ -288,6 +396,14 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
         if (!(file instanceof import_obsidian2.TFile)) return;
+        menu.addItem((item) => {
+          const isDisabled = this.isNoSync(file.path);
+          item.setTitle(isDisabled ? "Enable sync for this note" : "Disable sync for this note").setIcon(isDisabled ? "toggle-right" : "toggle-left").onClick(() => void this.toggleNoSync(file));
+        });
+        menu.addItem((item) => {
+          const isDisabled = this.isNoTaskSync(file.path);
+          item.setTitle(isDisabled ? "Enable task sync for this note" : "Disable task sync for this note").setIcon(isDisabled ? "check-square" : "square").onClick(() => void this.toggleNoTaskSync(file));
+        });
         menu.addItem((item) => {
           item.setTitle("Open remote version history").setIcon("history").onClick(() => void this.openRemoteHistory(file));
         });
@@ -351,15 +467,81 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         return true;
       }
     });
+    this.addCommand({
+      id: "sync-task-id-cleanup",
+      name: "Task ID cleanup (redownload IDs)",
+      callback: () => void this.cleanupTaskIds()
+    });
+    this.addCommand({
+      id: "sync-refresh-today",
+      name: "Refresh Today Focus note",
+      callback: () => void this.refreshTodayNote()
+    });
+    this.addCommand({
+      id: "sync-quick-capture",
+      name: "Quick capture task",
+      callback: () => void this.quickCaptureTask()
+    });
+    this.addCommand({
+      id: "sync-start-task",
+      name: "Start task (mark in progress)",
+      callback: () => void this.startTaskAtCursor()
+    });
+    this.addCommand({
+      id: "sync-snooze-task",
+      name: "Snooze task to tomorrow",
+      callback: () => void this.snoozeTaskToTomorrow()
+    });
+    this.addCommand({
+      id: "sync-timeblock-task",
+      name: "Add time block to task",
+      callback: () => void this.addTimeBlockToTask()
+    });
+    this.addCommand({
+      id: "sync-sort-tasks",
+      name: "Sort tasks in current note",
+      callback: () => void this.sortTasksInActiveFile()
+    });
+    this.addCommand({
+      id: "sync-update-progress",
+      name: "Update task progress line",
+      callback: () => void this.updateProgressLineInActiveFile()
+    });
+    this.addCommand({
+      id: "sync-refresh-daily-checklist",
+      name: "Refresh daily checklist",
+      callback: () => void this.refreshDailyChecklist()
+    });
+    this.addRibbonSeparator();
+    this.addRibbonAction("calendar", "Refresh Today Focus note", () => void this.refreshTodayNote());
+    this.addRibbonAction("plus-circle", "Quick capture task", () => void this.quickCaptureTask());
+    this.addRibbonAction("play-circle", "Start task (mark in progress)", () => void this.startTaskAtCursor());
+    this.addRibbonAction("clock-3", "Snooze task to tomorrow", () => void this.snoozeTaskToTomorrow());
+    this.addRibbonAction("clock", "Add time block to task", () => void this.addTimeBlockToTask());
+    this.addRibbonAction("arrow-down-up", "Sort tasks in current note", () => void this.sortTasksInActiveFile());
+    this.addRibbonAction("activity", "Update task progress line", () => void this.updateProgressLineInActiveFile());
+    this.addRibbonAction("list-checks", "Refresh daily checklist", () => void this.refreshDailyChecklist());
   }
   onunload() {
     for (const timer of this.debounceTimers.values()) {
       window.clearTimeout(timer);
     }
     this.debounceTimers.clear();
+    for (const timer of this.taskDebounceTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.taskDebounceTimers.clear();
     if (this.periodicSyncTimer) {
       window.clearInterval(this.periodicSyncTimer);
       this.periodicSyncTimer = null;
+    }
+    if (this.taskSyncTimer) {
+      window.clearInterval(this.taskSyncTimer);
+      this.taskSyncTimer = null;
+    }
+    if (this.reminderTimer) {
+      window.clearInterval(this.reminderTimer);
+      this.reminderTimer = null;
     }
   }
   setupPeriodicRemoteCheck() {
@@ -375,20 +557,537 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       void this.runPeriodicRemoteCheck();
     }, intervalMs);
     this.logDebug(`Periodic remote check enabled (${minutes}m).`);
+    void this.runPeriodicRemoteCheck();
+  }
+  setupTaskSyncInterval() {
+    if (this.taskSyncTimer) {
+      window.clearInterval(this.taskSyncTimer);
+      this.taskSyncTimer = null;
+    }
+    if (!this.settings.taskSyncIntervalEnabled) return;
+    const rawMinutes = Number.isFinite(this.settings.taskSyncIntervalMinutes) ? this.settings.taskSyncIntervalMinutes : 10;
+    const minutes = Math.max(1, Math.floor(rawMinutes));
+    const intervalMs = minutes * 60 * 1e3;
+    this.taskSyncTimer = window.setInterval(() => {
+      void this.runPeriodicTaskSync();
+    }, intervalMs);
+    this.logDebug(`Task sync interval enabled (${minutes}m).`);
+    void this.runPeriodicTaskSync();
+  }
+  setupReminders() {
+    if (this.reminderTimer) {
+      window.clearInterval(this.reminderTimer);
+      this.reminderTimer = null;
+    }
+    if (!this.settings.remindersEnabled) return;
+    const rawMinutes = Number.isFinite(this.settings.remindersMinutes) ? this.settings.remindersMinutes : 60;
+    const minutes = Math.max(5, Math.floor(rawMinutes));
+    const intervalMs = minutes * 60 * 1e3;
+    this.reminderTimer = window.setInterval(() => {
+      void this.runReminderCheck();
+    }, intervalMs);
+    this.logDebug(`Task reminders enabled (${minutes}m).`);
+    void this.runReminderCheck();
   }
   async runPeriodicRemoteCheck() {
     if (!this.settings.username || !this.settings.appPassword || !this.settings.nextcloudBaseUrl) {
       return;
     }
-    const files = this.app.vault.getMarkdownFiles();
-    for (const file of files) {
-      if (!this.isFileInScope(file)) continue;
-      this.enqueueRemoteCheck(file.path, "periodic");
+    if (this.periodicSyncInFlight) return;
+    this.periodicSyncInFlight = true;
+    this.startProgress();
+    this.updatePeriodicLock();
+    this.setStatus("syncing");
+    if (this.settings.periodicRemoteCheckNotices) {
+      new import_obsidian2.Notice("Nextcloud sync: periodic check started.");
     }
-    await this.syncRemoteDeletions("periodic");
+    this.logDebug("Periodic remote check: start");
+    const trackedPaths = Object.keys(this.state.files);
+    try {
+      if (this.hasDirtyFiles()) {
+        if (!this.pausePeriodic) {
+          this.pausePeriodic = true;
+          this.logDebug("Periodic check paused: dirty files pending.");
+        }
+        const cleared = await this.waitForNoDirtyFiles();
+        if (!cleared) {
+          this.logDebug("Periodic check aborted: dirty files still pending.");
+          return;
+        }
+        this.pausePeriodic = false;
+      }
+      for (const path of trackedPaths) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof import_obsidian2.TFile)) continue;
+        if (!this.isFileInScope(file)) continue;
+        this.enqueueRemoteCheck(file.path, "periodic");
+      }
+      await this.syncRemoteNewFiles("periodic");
+      await this.syncRemoteDeletions("periodic");
+      if (this.settings.periodicRemoteCheckNotices) {
+        new import_obsidian2.Notice("Nextcloud sync: periodic check finished.");
+      }
+    } finally {
+      this.periodicSyncInFlight = false;
+      this.updatePeriodicLock();
+      this.updateIdleStatus();
+    }
+  }
+  async runPeriodicTaskSync() {
+    if (!this.settings.enableTaskSync) return;
+    if (!this.settings.taskListUrl) return;
+    if (!this.settings.username || !this.settings.appPassword || !this.settings.nextcloudBaseUrl) {
+      return;
+    }
+    if (this.hasDirtyFiles()) return;
+    const client = this.getClientOrNotice();
+    if (!client) return;
+    const calendarUrl = this.normalizeCalendarUrl(this.settings.taskListUrl);
+    let remoteTasks;
+    try {
+      remoteTasks = await this.fetchRemoteTasks(client, calendarUrl);
+    } catch (error) {
+      const message = this.describeError(error);
+      this.logDebug(`Error (task interval): ${message}`);
+      return;
+    }
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const filesToUpdate = /* @__PURE__ */ new Map();
+    for (const state of Object.values(this.state.tasks)) {
+      if (this.isNoTaskSync(state.filePath)) continue;
+      const file = this.app.vault.getAbstractFileByPath(state.filePath);
+      if (!(file instanceof import_obsidian2.TFile)) continue;
+      if (!this.isFileInScope(file)) continue;
+      filesToUpdate.set(file.path, file);
+    }
+    for (const file of filesToUpdate.values()) {
+      let content = await this.app.vault.read(file);
+      const lines = content.split(/\r?\n/);
+      const tasks = parseTaskLines(lines, { useTasksPlugin });
+      let changed = false;
+      for (const task of tasks) {
+        if (!task.uid) continue;
+        const remote = remoteTasks.get(task.uid);
+        if (!remote) continue;
+        const state = this.state.tasks[task.uid];
+        if (!state) continue;
+        const localLine = task.raw.trimEnd();
+        const localChanged = state.lastSyncedLine !== localLine;
+        const remoteChanged = !!state.lastRemoteModified && remote.lastModified !== state.lastRemoteModified || !!state.lastRemoteEtag && remote.etag !== state.lastRemoteEtag;
+        if (!remoteChanged) continue;
+        if (localChanged) continue;
+        const updatedLine = buildTaskLine({
+          prefix: task.prefix,
+          checked: remote.completed,
+          summary: remote.summary,
+          tags: remote.categories,
+          meta: mapRemoteToTaskMeta(remote),
+          uid: task.uid,
+          statusSymbol: task.statusSymbol,
+          useTasksPlugin
+        });
+        lines[task.lineIndex] = updatedLine;
+        changed = true;
+        this.state.tasks[task.uid] = {
+          uid: task.uid,
+          filePath: file.path,
+          lastSyncedLine: updatedLine,
+          lastRemoteModified: remote.lastModified,
+          lastRemoteEtag: remote.etag
+        };
+      }
+      if (changed) {
+        this.suppressModifyForPaths.add(file.path);
+        await this.app.vault.modify(file, lines.join("\n"));
+      }
+    }
+    if (this.settings.taskInboxEnabled) {
+      await this.appendRemoteTasksToInbox(remoteTasks, useTasksPlugin);
+    }
+    await this.savePluginData();
+  }
+  async runReminderCheck() {
+    if (!this.settings.remindersEnabled) return;
+    const tasks = await this.collectAllOpenTasks();
+    const today = formatDateOnly(/* @__PURE__ */ new Date());
+    const overdue = [];
+    const dueToday = [];
+    for (const task of tasks) {
+      const due = task.meta.dueDate ?? task.meta.scheduledDate ?? task.meta.startDate;
+      if (!due) continue;
+      if (due < today) {
+        overdue.push(task);
+      } else if (due === today) {
+        dueToday.push(task);
+      }
+    }
+    let list = [];
+    if (this.settings.remindersMode === "overdue") {
+      list = overdue;
+    } else if (this.settings.remindersMode === "today") {
+      list = dueToday;
+    } else {
+      list = overdue.concat(dueToday);
+    }
+    if (list.length === 0) return;
+    const count = Math.min(this.settings.remindersMaxCount, list.length);
+    const label = list.length === 1 ? "task" : "tasks";
+    new import_obsidian2.Notice(`Nextcloud sync: ${list.length} ${label} due. Showing top ${count}.`);
+  }
+  async collectAllOpenTasks() {
+    const tasks = [];
+    const files = this.app.vault.getMarkdownFiles();
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    for (const file of files) {
+      if (this.isNoTaskSync(file.path)) continue;
+      if (!this.isFileInScope(file)) continue;
+      const content = await this.app.vault.read(file);
+      const lines = content.split(/\r?\n/);
+      const parsed = parseTaskLines(lines, { useTasksPlugin });
+      for (const task of parsed) {
+        if (!task.checked && task.summary.trim()) {
+          tasks.push(task);
+        }
+      }
+    }
+    return tasks;
+  }
+  async appendRemoteTasksToInbox(remoteTasks, useTasksPlugin) {
+    const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+    this.ensureInboxNoSync(inboxPath);
+    if (this.isNoTaskSync(inboxPath)) return;
+    let inboxFile = this.app.vault.getAbstractFileByPath(inboxPath);
+    if (!inboxFile) {
+      const folder = inboxPath.split("/").slice(0, -1).join("/");
+      await this.ensureLocalFolder(folder);
+      inboxFile = await this.app.vault.create(inboxPath, "# Task Inbox\n");
+    }
+    if (!(inboxFile instanceof import_obsidian2.TFile)) return;
+    let content = await this.app.vault.read(inboxFile);
+    content = this.ensureInboxQueryBlock(content);
+    const lines = content.split(/\r?\n/);
+    const existingTasks = parseTaskLines(lines, { useTasksPlugin });
+    const existingUids = new Set(existingTasks.map((task) => task.uid).filter(Boolean));
+    const newLines = [];
+    for (const remote of remoteTasks.values()) {
+      if (this.state.tasks[remote.uid]) continue;
+      if (existingUids.has(remote.uid)) continue;
+      const line = buildTaskLine({
+        prefix: "- ",
+        checked: remote.completed,
+        summary: remote.summary,
+        tags: remote.categories,
+        meta: mapRemoteToTaskMeta(remote),
+        uid: remote.uid,
+        statusSymbol: remote.completed ? "x" : " ",
+        useTasksPlugin
+      });
+      newLines.push(line);
+      this.state.tasks[remote.uid] = {
+        uid: remote.uid,
+        filePath: inboxPath,
+        lastSyncedLine: line,
+        lastRemoteModified: remote.lastModified,
+        lastRemoteEtag: remote.etag
+      };
+    }
+    if (newLines.length === 0) return;
+    const separator = content.endsWith("\n") || content.length === 0 ? "" : "\n";
+    const updated = content + separator + newLines.join("\n") + "\n";
+    this.suppressModifyForPaths.add(inboxPath);
+    await this.app.vault.modify(inboxFile, updated);
+  }
+  ensureInboxQueryBlock(content) {
+    const query = this.settings.taskInboxQuery.trim();
+    if (!query) return content;
+    const hasQuery = /```tasks[\s\S]*?```/m.test(content);
+    if (hasQuery) return content;
+    const block = `${query}
+
+`;
+    if (content.trim().length === 0) {
+      return `# Task Inbox
+
+${block}`;
+    }
+    return content.startsWith("#") ? `${content}
+
+${block}` : `# Task Inbox
+
+${block}${content}`;
+  }
+  async reconcileTaskOwnership(file, content) {
+    if (!this.settings.taskInboxEnabled) return;
+    if (!this.settings.taskInboxAutoMove) return;
+    const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+    this.ensureInboxNoSync(inboxPath);
+    if (file.path === inboxPath) return;
+    if (this.isNoTaskSync(file.path)) return;
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const lines = content.split(/\r?\n/);
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
+    const seen = /* @__PURE__ */ new Set();
+    let moved = false;
+    for (const task of tasks) {
+      if (!task.uid) continue;
+      if (seen.has(task.uid)) continue;
+      seen.add(task.uid);
+      const state = this.state.tasks[task.uid];
+      if (!state) continue;
+      if (state.filePath !== inboxPath) continue;
+      state.filePath = file.path;
+      state.lastSyncedLine = task.raw.trimEnd();
+      this.state.tasks[task.uid] = state;
+      this.suppressTaskDeletePrompt.add(task.uid);
+      await this.removeTaskLineByUid(inboxPath, task.uid);
+      moved = true;
+    }
+    if (moved) {
+      await this.savePluginData();
+    }
+  }
+  async removeTaskLineByUid(path, uid) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian2.TFile)) return;
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
+    let changed = false;
+    for (const task of tasks) {
+      if (task.uid !== uid) continue;
+      lines.splice(task.lineIndex, 1);
+      changed = true;
+      break;
+    }
+    if (!changed) return;
+    this.suppressModifyForPaths.add(path);
+    await this.app.vault.modify(file, lines.join("\n"));
+  }
+  resolvePathTemplate(template) {
+    const date = formatDateOnly(/* @__PURE__ */ new Date());
+    return template.replace(/\{\{date\}\}/g, date);
+  }
+  async refreshTodayNote() {
+    if (!this.settings.todayNoteEnabled) return;
+    const path = this.resolvePathTemplate(this.settings.todayNotePath.trim() || "Today.md");
+    const limit = Math.max(1, this.settings.todayNoteLimit);
+    const useQuery = this.settings.todayNoteUseQuery && this.isTasksPluginEnabled();
+    let content = `# Today Focus
+
+`;
+    if (useQuery) {
+      const query = (this.settings.todayNoteQuery || "").replace(/\{\{limit\}\}/g, String(limit));
+      content += `${query}
+`;
+    } else {
+      const tasks = await this.collectAllOpenTasks();
+      const sorted = tasks.sort((a, b) => compareTaskPriority(a, b));
+      const top = sorted.slice(0, limit);
+      if (top.length === 0) {
+        content += "_No open tasks._\n";
+      } else {
+        for (const task of top) {
+          content += `- [ ] ${task.summary}
+`;
+        }
+      }
+    }
+    await this.writeNote(path, content, true);
+    await this.updateProgressLine(path);
+  }
+  async refreshDailyChecklist() {
+    if (!this.settings.dailyChecklistEnabled) return;
+    const today = formatDateOnly(/* @__PURE__ */ new Date());
+    if (this.state.lastChecklistDate === today) return;
+    const path = this.resolvePathTemplate(this.settings.dailyChecklistPath.trim() || "Daily Checklist.md");
+    this.ensureChecklistNoSync(path);
+    const content = `# Daily Checklist (${today})
+
+${this.settings.dailyChecklistTemplate.trim()}
+`;
+    await this.writeNote(path, content, true);
+    this.state.lastChecklistDate = today;
+    await this.savePluginData();
+  }
+  async quickCaptureTask() {
+    const data = await this.promptQuickCapture();
+    if (!data || !data.summary.trim()) return;
+    const path = this.resolvePathTemplate(this.settings.quickCapturePath.trim() || "Task Inbox.md");
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const shouldAddUid = this.settings.enableTaskSync && this.settings.taskListUrl.trim().length > 0;
+    const line = shouldAddUid ? buildTaskLine({
+      prefix: "- ",
+      checked: data.checked,
+      summary: data.summary.trim(),
+      tags: data.tags,
+      meta: data.meta,
+      uid: generateUid(),
+      statusSymbol: data.statusSymbol,
+      useTasksPlugin
+    }) : buildTaskLineNoUid({
+      summary: data.summary.trim(),
+      checked: data.checked,
+      tags: data.tags,
+      meta: data.meta,
+      statusSymbol: data.statusSymbol,
+      useTasksPlugin
+    });
+    await this.appendLineToNote(path, line);
+    if (this.settings.enableTaskSync && this.settings.taskListUrl.trim()) {
+      await this.syncTasksForPath(path);
+    }
+  }
+  async startTaskAtCursor() {
+    const result = await this.getActiveFileAndLine();
+    if (!result) return;
+    const { file, lineIndex, lines } = result;
+    const line = lines[lineIndex] ?? "";
+    if (!isTaskLine(line)) return;
+    let updated = line;
+    if (!updated.includes("#doing")) {
+      updated = `${updated} #doing`.trimEnd();
+    }
+    lines.splice(lineIndex, 1);
+    const insertIndex = findFirstTaskIndex(lines);
+    lines.splice(insertIndex, 0, updated);
+    await this.writeFileLines(file, lines);
+  }
+  async snoozeTaskToTomorrow() {
+    const result = await this.getActiveFileAndLine();
+    if (!result) return;
+    const { file, lineIndex, lines } = result;
+    let line = lines[lineIndex] ?? "";
+    if (!isTaskLine(line)) return;
+    const tomorrow = formatDateOnly(new Date(Date.now() + 864e5));
+    if (line.match(/📅\s*\d{4}-\d{2}-\d{2}/)) {
+      line = line.replace(/📅\s*\d{4}-\d{2}-\d{2}/, `\u{1F4C5} ${tomorrow}`);
+    } else {
+      line = `${line} \u{1F4C5} ${tomorrow}`.trimEnd();
+    }
+    lines[lineIndex] = line;
+    await this.writeFileLines(file, lines);
+  }
+  async addTimeBlockToTask() {
+    const result = await this.getActiveFileAndLine();
+    if (!result) return;
+    const { file, lineIndex, lines } = result;
+    let line = lines[lineIndex] ?? "";
+    if (!isTaskLine(line)) return;
+    const value = window.prompt("Time block (e.g., 10:00-11:00):");
+    if (!value || !value.trim()) return;
+    if (line.match(/🕒\s*[^\s]+/)) {
+      line = line.replace(/🕒\s*[^\s]+/, `\u{1F552} ${value.trim()}`);
+    } else {
+      line = `${line} \u{1F552} ${value.trim()}`.trimEnd();
+    }
+    lines[lineIndex] = line;
+    await this.writeFileLines(file, lines);
+  }
+  async sortTasksInActiveFile() {
+    const result = await this.getActiveFileAndLine();
+    if (!result) return;
+    const { file, lines } = result;
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
+    if (tasks.length === 0) return;
+    const sorted = [...tasks].sort((a, b) => compareTaskPriority(a, b));
+    const sortedLines = sorted.map((task) => task.raw.trimEnd());
+    let cursor = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (isTaskLine(lines[i])) {
+        lines[i] = sortedLines[cursor] ?? lines[i];
+        cursor += 1;
+      }
+    }
+    await this.writeFileLines(file, lines);
+  }
+  async updateProgressLineInActiveFile() {
+    const result = await this.getActiveFileAndLine();
+    if (!result) return;
+    await this.updateProgressLine(result.file.path);
+  }
+  async updateProgressLine(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian2.TFile)) return;
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const tasks = parseTaskLines(lines, { useTasksPlugin: this.isTasksPluginEnabled() });
+    const total = tasks.length;
+    const done = tasks.filter((t) => t.checked).length;
+    const percent = total === 0 ? 0 : Math.round(done / total * 100);
+    const progressLine = `Progress: ${done}/${total} (${percent}%)`;
+    const existingIndex = lines.findIndex((line) => line.startsWith("Progress:"));
+    if (existingIndex !== -1) {
+      lines[existingIndex] = progressLine;
+    } else {
+      const insertIndex = lines[0]?.startsWith("#") ? 1 : 0;
+      lines.splice(insertIndex, 0, progressLine);
+    }
+    await this.writeFileLines(file, lines);
+  }
+  async writeNote(path, content, overwrite) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      const folder = path.split("/").slice(0, -1).join("/");
+      await this.ensureLocalFolder(folder);
+      await this.app.vault.create(path, content);
+      return;
+    }
+    if (file instanceof import_obsidian2.TFile && overwrite) {
+      this.suppressModifyForPaths.add(path);
+      await this.app.vault.modify(file, content);
+    }
+  }
+  async appendLineToNote(path, line) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      const folder = path.split("/").slice(0, -1).join("/");
+      await this.ensureLocalFolder(folder);
+      await this.app.vault.create(path, `# ${getFileName(path)}
+
+${line}
+`);
+      return;
+    }
+    if (file instanceof import_obsidian2.TFile) {
+      const content = await this.app.vault.read(file);
+      const separator = content.endsWith("\n") || content.length === 0 ? "" : "\n";
+      this.suppressModifyForPaths.add(path);
+      await this.app.vault.modify(file, content + separator + line + "\n");
+    }
+  }
+  async syncTasksForPath(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian2.TFile)) return;
+    let content = await this.app.vault.read(file);
+    const result = await this.syncTasksForFile(file, content, { force: true });
+    if (result.changed) {
+      this.suppressModifyForPaths.add(file.path);
+      await this.app.vault.modify(file, result.content);
+    }
+  }
+  async getActiveFileAndLine() {
+    const view = this.app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView);
+    const file = view?.file;
+    const editor = view?.editor;
+    if (!file || !editor) return null;
+    const lineIndex = editor.getCursor().line;
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    return { file, lineIndex, lines };
+  }
+  async writeFileLines(file, lines) {
+    this.suppressModifyForPaths.add(file.path);
+    await this.app.vault.modify(file, lines.join("\n"));
+  }
+  async promptQuickCapture() {
+    return await new Promise((resolve) => {
+      new QuickCaptureModal(this.app, resolve).open();
+    });
   }
   isTasksPluginEnabled() {
-    const plugins = this.app?.plugins;
+    const plugins = this.app.plugins;
     if (!plugins) return false;
     const enabledSet = plugins.enabledPlugins;
     if (enabledSet && !enabledSet.has("obsidian-tasks-plugin")) return false;
@@ -508,7 +1207,10 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         files: data.state?.files ?? {},
         conflicts: data.state?.conflicts ?? {},
         deletionsApplied: data.state?.deletionsApplied ?? {},
-        tasks: data.state?.tasks ?? {}
+        tasks: data.state?.tasks ?? {},
+        noSync: data.state?.noSync ?? {},
+        noTaskSync: data.state?.noTaskSync ?? {},
+        lastChecklistDate: data.state?.lastChecklistDate ?? null
       };
       if (!wasUsernameEncrypted || !wasPasswordEncrypted || !wasNextcloudEncrypted || !wasTaskListEncrypted || !wasCaldavEncrypted) {
         await this.savePluginData();
@@ -521,7 +1223,10 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         files: legacy?.files ?? {},
         conflicts: legacy?.conflicts ?? {},
         deletionsApplied: legacy?.deletionsApplied ?? {},
-        tasks: legacy?.tasks ?? {}
+        tasks: legacy?.tasks ?? {},
+        noSync: {},
+        noTaskSync: {},
+        lastChecklistDate: null
       };
     }
   }
@@ -542,6 +1247,12 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
   }
   onVaultModify(file) {
     if (!(file instanceof import_obsidian2.TFile)) return;
+    if (this.isNoSync(file.path)) {
+      if (this.settings.enableTaskSync && !this.isNoTaskSync(file.path)) {
+        this.scheduleTaskDebouncedSync(file.path);
+      }
+      return;
+    }
     if (!this.isFileInScope(file)) return;
     if (this.suppressModifyForPaths.has(file.path)) {
       this.suppressModifyForPaths.delete(file.path);
@@ -557,10 +1268,24 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       this.suppressDeletePrompt.delete(file.path);
       return;
     }
+    if (this.settings.taskInboxEnabled) {
+      const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+      if (file.path === inboxPath) {
+        void this.restoreTaskInbox();
+        new import_obsidian2.Notice("Nextcloud sync: Task Inbox cannot be deleted.");
+        return;
+      }
+    }
     this.fileStatuses.delete(file.path);
     this.updateFileExplorerIcon(file.path, null);
     if (this.state.conflicts[file.path]) {
       delete this.state.conflicts[file.path];
+    }
+    if (this.state.noSync[file.path]) {
+      delete this.state.noSync[file.path];
+    }
+    if (this.state.noTaskSync[file.path]) {
+      delete this.state.noTaskSync[file.path];
     }
     const lastState = this.state.files[file.path];
     if (this.state.files[file.path]) {
@@ -586,6 +1311,20 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
   }
   async onVaultRename(file, oldPath) {
     if (file.path === oldPath) return;
+    if (this.settings.taskInboxEnabled) {
+      const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+      if (oldPath === inboxPath && file.path !== inboxPath && file instanceof import_obsidian2.TFile) {
+        try {
+          await this.app.fileManager.renameFile(file, inboxPath);
+          this.ensureInboxNoSync(inboxPath);
+          await this.savePluginData();
+          new import_obsidian2.Notice("Nextcloud sync: Task Inbox cannot be renamed.");
+        } catch (error) {
+          this.logDebug(`Inbox rename restore failed: ${this.describeError(error)}`);
+        }
+        return;
+      }
+    }
     if (file instanceof import_obsidian2.TFile) {
       await this.handleFileRename(file, oldPath);
       return;
@@ -689,6 +1428,8 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     this.renamePrefixInQueue(oldPath, newPath);
     this.clearDebounceTimersForPrefix(oldPath);
     this.updateTaskPathsForRename(oldPath, newPath);
+    this.renamePrefixInRecord(this.state.noSync, oldPath, newPath);
+    this.renamePrefixInRecord(this.state.noTaskSync, oldPath, newPath);
     if (this.currentSyncPath === oldPath) {
       this.currentSyncPath = newPath;
     }
@@ -732,6 +1473,8 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     this.renamePrefixInQueue(oldPath, newPath);
     this.clearDebounceTimersForPrefix(oldPath);
     this.updateTaskPathsForRename(oldPath, newPath);
+    this.renamePrefixInRecord(this.state.noSync, oldPath, newPath);
+    this.renamePrefixInRecord(this.state.noTaskSync, oldPath, newPath);
     movedFiles = movedFiles.filter((path) => {
       const fileItem = this.app.vault.getAbstractFileByPath(path);
       if (!(fileItem instanceof import_obsidian2.TFile) || !this.isFileInScope(fileItem)) {
@@ -746,9 +1489,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     if (this.currentSyncPath && (this.currentSyncPath === oldPath || this.currentSyncPath.startsWith(`${oldPath}/`))) {
       this.currentSyncPath = newPath + this.currentSyncPath.slice(oldPath.length);
     }
-    const scopedFiles = this.app.vault.getMarkdownFiles().filter(
-      (fileItem) => fileItem.path.startsWith(`${newPath}/`) && this.isFileInScope(fileItem)
-    );
+    const scopedFiles = this.app.vault.getMarkdownFiles().filter((fileItem) => fileItem.path.startsWith(`${newPath}/`) && this.isFileInScope(fileItem));
     if (scopedFiles.length === 0) {
       await this.savePluginData();
       return;
@@ -789,11 +1530,38 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
   onFileOpen(file) {
     const previous = this.lastActiveFile;
     this.lastActiveFile = file;
-    if (this.settings.syncOnFileClose && previous && previous !== file && this.isFileInScope(previous)) {
-      this.enqueueSync(previous.path, "file-close");
+    if (this.settings.syncOnFileClose && previous && previous !== file) {
+      let isArchive = false;
+      let isInbox = false;
+      if (this.settings.taskInboxEnabled) {
+        const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+        const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+        if (previous.path === inboxPath) {
+          isInbox = true;
+          void this.archiveInboxCompleted();
+        }
+        if (previous.path === archivePath) {
+          isArchive = true;
+          void this.restoreArchiveToInbox();
+        }
+      }
+      if (this.isNoSync(previous.path)) {
+        if (!isArchive && !isInbox && this.settings.enableTaskSync && !this.isNoTaskSync(previous.path)) {
+          void this.syncTasksForPath(previous.path);
+        }
+      } else if (this.isFileInScope(previous)) {
+        this.enqueueSync(previous.path, "file-close");
+      }
     }
     if (this.settings.checkRemoteOnOpen && file && this.isFileInScope(file)) {
       this.enqueueRemoteCheck(file.path, "file-open");
+    }
+    if (file && this.settings.taskInboxEnabled) {
+      const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+      if (file.path === archivePath) {
+        this.ensureArchiveNoSync(archivePath);
+        void this.savePluginData();
+      }
     }
   }
   onWindowFocus() {
@@ -818,10 +1586,22 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     }, this.settings.debounceMs);
     this.debounceTimers.set(path, timer);
   }
+  scheduleTaskDebouncedSync(path) {
+    const current = this.taskDebounceTimers.get(path);
+    if (current) {
+      window.clearTimeout(current);
+    }
+    const timer = window.setTimeout(() => {
+      this.taskDebounceTimers.delete(path);
+      void this.syncTasksForPath(path);
+    }, this.settings.debounceMs);
+    this.taskDebounceTimers.set(path, timer);
+  }
   enqueueSync(path, reason) {
     if (!this.queuedPaths.has(path)) {
       this.queue.push({ path, reason, kind: "sync" });
       this.queuedPaths.add(path);
+      this.addProgressTotal(1);
       this.logDebug(`Queued: ${path} (${reason})`);
     }
     void this.processQueue();
@@ -830,6 +1610,10 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     if (!this.queuedPaths.has(path)) {
       this.queue.push({ path, reason, kind: "check" });
       this.queuedPaths.add(path);
+      if (reason === "periodic") {
+        this.updatePeriodicLock();
+      }
+      this.addProgressTotal(1);
       this.logDebug(`Queued (check): ${path} (${reason})`);
     }
     void this.processQueue();
@@ -842,26 +1626,41 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         const task = this.queue.shift();
         if (!task) continue;
         this.queuedPaths.delete(task.path);
+        if (task.reason === "periodic") {
+          this.updatePeriodicLock();
+        }
         this.logDebug(`Processing: ${task.path} (${task.reason})`);
         if (task.kind === "check") {
           await this.checkRemoteForPath(task.path, task.reason);
         } else {
           await this.syncFileByPath(task.path, task.reason);
         }
+        if (task.reason === "periodic") {
+          this.updatePeriodicLock();
+        }
+        this.markProgressDone(1);
       }
     } finally {
       this.queueRunning = false;
-      if (this.queue.length === 0) {
-        this.setStatus("idle");
-      }
+      this.updatePeriodicLock();
+      this.updateIdleStatus();
     }
   }
   async syncAllMarkdown() {
+    if (this.hasDirtyFiles()) {
+      new import_obsidian2.Notice("Nextcloud sync: waiting for dirty files before Sync all.");
+      const cleared = await this.waitForNoDirtyFiles();
+      if (!cleared) {
+        new import_obsidian2.Notice("Nextcloud sync: Sync all canceled (dirty files still pending).");
+        return;
+      }
+    }
     const files = this.app.vault.getMarkdownFiles();
     for (const file of files) {
       if (!this.isFileInScope(file)) continue;
       this.enqueueSync(file.path, "manual-all");
     }
+    await this.syncRemoteNewFiles("manual-all");
   }
   getRemoteBaseUrl() {
     const base = this.settings.nextcloudBaseUrl.replace(/\/+$/, "");
@@ -874,22 +1673,25 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     return `${root}/${localPath}`;
   }
   isFileInScope(file) {
-    if (!file.path.endsWith(".md")) return false;
-    if (this.settings.enableChangelog && file.path === this.settings.changelogPath) {
+    return this.isPathInScope(file.path);
+  }
+  isPathInScope(path) {
+    if (this.isNoSync(path)) return false;
+    if (!path.endsWith(".md")) return false;
+    if (this.settings.enableChangelog && path === this.settings.changelogPath) {
       return false;
     }
-    if (this.isInConflictArchive(file.path)) {
+    if (this.isInConflictArchive(path)) {
       return false;
     }
-    if (this.isInPreviewFolder(file.path)) {
+    if (this.isInPreviewFolder(path)) {
       return false;
     }
-    if (this.isDeletionsLog(file.path)) {
+    if (this.isDeletionsLog(path)) {
       return false;
     }
     const includePatterns = parsePatterns(this.settings.includePatterns);
     const excludePatterns = parsePatterns(this.settings.excludePatterns);
-    const path = file.path;
     if (includePatterns.length > 0 && !matchAnyGlob(path, includePatterns)) {
       return false;
     }
@@ -897,6 +1699,185 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       return false;
     }
     return true;
+  }
+  isNoSync(path) {
+    return Boolean(this.state.noSync[path]);
+  }
+  isNoTaskSync(path) {
+    return Boolean(this.state.noTaskSync[path]);
+  }
+  async toggleNoSync(file) {
+    if (this.isNoSync(file.path)) {
+      delete this.state.noSync[file.path];
+      await this.reconcileNoteTaskState(file);
+      new import_obsidian2.Notice(`Nextcloud sync: enabled for ${file.path}`);
+    } else {
+      this.state.noSync[file.path] = true;
+      this.fileStatuses.delete(file.path);
+      this.updateFileExplorerIcon(file.path, null);
+      new import_obsidian2.Notice(`Nextcloud sync: disabled for ${file.path}`);
+    }
+    await this.savePluginData();
+  }
+  async toggleNoTaskSync(file) {
+    if (this.isNoTaskSync(file.path)) {
+      delete this.state.noTaskSync[file.path];
+      new import_obsidian2.Notice(`Nextcloud sync: task sync enabled for ${file.path}`);
+    } else {
+      this.state.noTaskSync[file.path] = true;
+      new import_obsidian2.Notice(`Nextcloud sync: task sync disabled for ${file.path}`);
+    }
+    await this.savePluginData();
+  }
+  async reconcileNoteTaskState(file) {
+    if (!this.settings.enableTaskSync) return;
+    if (!this.settings.taskListUrl) return;
+    if (this.isNoTaskSync(file.path)) return;
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const tasks = parseTaskLines(lines, { useTasksPlugin: this.isTasksPluginEnabled() });
+    let changed = false;
+    for (const task of tasks) {
+      if (!task.uid) continue;
+      const state = this.state.tasks[task.uid];
+      if (!state) {
+        this.state.tasks[task.uid] = {
+          uid: task.uid,
+          filePath: file.path,
+          lastSyncedLine: task.raw.trimEnd(),
+          lastRemoteModified: null,
+          lastRemoteEtag: null
+        };
+        changed = true;
+        continue;
+      }
+      if (state.filePath !== file.path) {
+        state.filePath = file.path;
+        state.lastSyncedLine = task.raw.trimEnd();
+        this.state.tasks[task.uid] = state;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.savePluginData();
+    }
+  }
+  ensureInboxNoSync(inboxPath) {
+    if (!this.settings.taskInboxEnabled) return;
+    if (!inboxPath) return;
+    this.state.noSync[inboxPath] = true;
+    if (this.state.noTaskSync[inboxPath]) {
+      delete this.state.noTaskSync[inboxPath];
+    }
+  }
+  ensureArchiveNoSync(path) {
+    if (!path) return;
+    this.state.noSync[path] = true;
+    this.state.noTaskSync[path] = true;
+  }
+  ensureChecklistNoSync(path) {
+    if (!path) return;
+    this.state.noSync[path] = true;
+  }
+  async archiveInboxCompleted() {
+    const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+    const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+    const inboxFile = this.app.vault.getAbstractFileByPath(inboxPath);
+    if (!(inboxFile instanceof import_obsidian2.TFile)) return;
+    const content = await this.app.vault.read(inboxFile);
+    const lines = content.split(/\r?\n/);
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
+    const completed = tasks.filter((t) => t.checked);
+    if (completed.length === 0) return;
+    const remaining = new Set(tasks.filter((t) => !t.checked).map((t) => t.lineIndex));
+    const updatedLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (isTaskLine(lines[i]) && !remaining.has(i)) continue;
+      updatedLines.push(lines[i]);
+    }
+    for (const task of completed) {
+      if (task.uid) {
+        this.suppressTaskDeletePrompt.add(task.uid);
+      }
+    }
+    this.suppressModifyForPaths.add(inboxPath);
+    await this.app.vault.modify(inboxFile, updatedLines.join("\n"));
+    await this.appendLineToNote(archivePath, "");
+    const archiveFile = this.app.vault.getAbstractFileByPath(archivePath);
+    if (archiveFile instanceof import_obsidian2.TFile) {
+      const archiveContent = await this.app.vault.read(archiveFile);
+      const separator = archiveContent.endsWith("\n") || archiveContent.length === 0 ? "" : "\n";
+      const completedLines = completed.map((t) => t.raw.trimEnd()).join("\n");
+      this.suppressModifyForPaths.add(archivePath);
+      await this.app.vault.modify(archiveFile, archiveContent + separator + completedLines + "\n");
+    }
+    this.ensureArchiveNoSync(archivePath);
+    await this.savePluginData();
+  }
+  async restoreArchiveToInbox() {
+    const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+    const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+    const archiveFile = this.app.vault.getAbstractFileByPath(archivePath);
+    if (!(archiveFile instanceof import_obsidian2.TFile)) return;
+    const content = await this.app.vault.read(archiveFile);
+    const lines = content.split(/\r?\n/);
+    const useTasksPlugin = this.isTasksPluginEnabled();
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
+    const reopened = tasks.filter((t) => !t.checked);
+    if (reopened.length === 0) return;
+    const remaining = new Set(tasks.filter((t) => t.checked).map((t) => t.lineIndex));
+    const updatedLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (isTaskLine(lines[i]) && !remaining.has(i)) continue;
+      updatedLines.push(lines[i]);
+    }
+    for (const task of reopened) {
+      if (task.uid) {
+        this.suppressTaskDeletePrompt.add(task.uid);
+      }
+    }
+    this.suppressModifyForPaths.add(archivePath);
+    await this.app.vault.modify(archiveFile, updatedLines.join("\n"));
+    this.ensureInboxNoSync(inboxPath);
+    const inboxFile = this.app.vault.getAbstractFileByPath(inboxPath);
+    if (inboxFile instanceof import_obsidian2.TFile) {
+      const inboxContent = await this.app.vault.read(inboxFile);
+      const separator = inboxContent.endsWith("\n") || inboxContent.length === 0 ? "" : "\n";
+      const reopenedLines = reopened.map((t) => t.raw.trimEnd()).join("\n");
+      this.suppressModifyForPaths.add(inboxPath);
+      await this.app.vault.modify(inboxFile, inboxContent + separator + reopenedLines + "\n");
+    }
+    for (const task of reopened) {
+      if (!task.uid) continue;
+      const state = this.state.tasks[task.uid];
+      if (state) {
+        state.filePath = inboxPath;
+        state.lastSyncedLine = task.raw.trimEnd();
+        this.state.tasks[task.uid] = state;
+      }
+    }
+    await this.savePluginData();
+    await this.syncTasksForPath(inboxPath);
+  }
+  async restoreTaskInbox() {
+    const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+    this.ensureInboxNoSync(inboxPath);
+    let file = this.app.vault.getAbstractFileByPath(inboxPath);
+    if (!file) {
+      const folder = inboxPath.split("/").slice(0, -1).join("/");
+      await this.ensureLocalFolder(folder);
+      const content = this.ensureInboxQueryBlock("# Task Inbox\n\n");
+      file = await this.app.vault.create(inboxPath, content);
+    } else if (file instanceof import_obsidian2.TFile) {
+      const content = await this.app.vault.read(file);
+      const updated = this.ensureInboxQueryBlock(content);
+      if (updated !== content) {
+        this.suppressModifyForPaths.add(inboxPath);
+        await this.app.vault.modify(file, updated);
+      }
+    }
+    await this.savePluginData();
   }
   isInConflictArchive(path) {
     const folder = this.settings.conflictArchiveFolder.trim();
@@ -914,26 +1895,93 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
   }
   setStatus(status) {
     if (!this.statusBarItem) return;
+    this.currentStatus = status;
     this.statusBarItem.empty();
-    const detail = this.currentSyncPath ? ` ${this.currentSyncPath}` : "";
+    const detail = this.lockStatusPath ? " periodic check" : this.currentSyncPath ? ` ${this.currentSyncPath}` : "";
+    const percent = this.progressActive && this.progressTotal > 0 ? ` (${Math.min(100, Math.floor(this.progressDone / this.progressTotal * 100))}%)` : "";
     switch (status) {
       case "syncing":
         (0, import_obsidian2.setIcon)(this.statusBarItem, "sync");
-        this.statusBarItem.appendText(` Syncing${detail}`);
+        this.statusBarItem.appendText(` Syncing${detail}${percent}`);
         break;
       case "conflict":
         (0, import_obsidian2.setIcon)(this.statusBarItem, "alert-triangle");
-        this.statusBarItem.appendText(` Conflict${detail}`);
+        this.statusBarItem.appendText(` Conflict${detail}${percent}`);
         break;
       case "error":
         (0, import_obsidian2.setIcon)(this.statusBarItem, "x-circle");
-        this.statusBarItem.appendText(` Error${detail}`);
+        this.statusBarItem.appendText(` Error${detail}${percent}`);
         break;
       default:
         (0, import_obsidian2.setIcon)(this.statusBarItem, "check-circle");
-        this.statusBarItem.appendText(` Idle${detail}`);
+        this.statusBarItem.appendText(` Idle${detail}${percent}`);
         break;
     }
+  }
+  hasPeriodicWork() {
+    if (this.periodicSyncInFlight) return true;
+    return this.queue.some((task) => task.reason === "periodic");
+  }
+  updateIdleStatus() {
+    if (this.queueRunning) return;
+    if (this.queue.length > 0) return;
+    if (this.hasPeriodicWork()) return;
+    this.currentSyncPath = null;
+    this.progressActive = false;
+    this.progressTotal = 0;
+    this.progressDone = 0;
+    this.setStatus("idle");
+  }
+  hasDirtyFiles() {
+    for (const status of this.fileStatuses.values()) {
+      if (status === "dirty") return true;
+    }
+    return false;
+  }
+  async waitForNoDirtyFiles(timeoutMs = 12e4) {
+    if (!this.hasDirtyFiles()) return true;
+    return await new Promise((resolve) => {
+      const interval = window.setInterval(() => {
+        if (!this.hasDirtyFiles()) {
+          window.clearInterval(interval);
+          resolve(true);
+        }
+      }, 250);
+      window.setTimeout(() => {
+        window.clearInterval(interval);
+        resolve(!this.hasDirtyFiles());
+      }, timeoutMs);
+    });
+  }
+  updatePeriodicLock() {
+    const shouldLock = this.hasPeriodicWork();
+    if (!shouldLock) {
+      this.lockStatusPath = false;
+      return;
+    }
+    this.lockStatusPath = true;
+    this.currentSyncPath = "periodic check";
+    this.setStatus(this.currentStatus);
+  }
+  startProgress() {
+    if (this.progressActive) return;
+    this.progressActive = true;
+    this.progressTotal = 0;
+    this.progressDone = 0;
+  }
+  addProgressTotal(count = 1) {
+    if (count <= 0) return;
+    this.startProgress();
+    this.progressTotal += count;
+    this.setStatus(this.currentStatus);
+  }
+  markProgressDone(count = 1) {
+    if (!this.progressActive) return;
+    this.progressDone += count;
+    if (this.progressDone > this.progressTotal) {
+      this.progressTotal = this.progressDone;
+    }
+    this.setStatus(this.currentStatus);
   }
   async syncFileByPath(path, reason) {
     const file = this.app.vault.getAbstractFileByPath(path);
@@ -954,7 +2002,9 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       }
       return;
     }
-    this.currentSyncPath = path;
+    if (!this.lockStatusPath) {
+      this.currentSyncPath = path;
+    }
     this.setStatus("syncing");
     const baseUrl = this.getRemoteBaseUrl();
     if (!this.settings.username || !this.settings.appPassword || !this.settings.nextcloudBaseUrl) {
@@ -978,7 +2028,8 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       lastSyncedHash: null,
       lastKnownEtag: null,
       lastSyncTimestamp: null,
-      lastKnownRemoteMtime: null
+      lastKnownRemoteMtime: null,
+      lastKnownLocalMtime: null
     };
     const syncAttempt = async () => {
       let remoteInfo = null;
@@ -1004,7 +2055,14 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
           throw await this.handleWebDavError(response2, file.path);
         }
         this.logDebug(`Uploaded (new): ${remotePath}`);
-        await this.updateStateAfterUpload(client, file.path, remotePath, localHash, state);
+        await this.updateStateAfterUpload(
+          client,
+          file.path,
+          remotePath,
+          localHash,
+          file.stat.mtime,
+          state
+        );
         this.setFileStatus(file.path, "synced");
         await this.appendChangelogEntry(file.path, reason);
         return;
@@ -1028,6 +2086,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         state.lastSyncedHash = localHash;
         state.lastKnownEtag = remoteInfo.etag;
         state.lastKnownRemoteMtime = remoteInfo.lastModified;
+        state.lastKnownLocalMtime = file.stat.mtime;
         state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
         this.state.files[file.path] = state;
         await this.savePluginData();
@@ -1056,9 +2115,11 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         const remoteContent = await response2.text();
         this.suppressModifyForPaths.add(file.path);
         await this.app.vault.modify(file, remoteContent);
+        await this.reconcileTaskOwnership(file, remoteContent);
         state.lastSyncedHash = await hashString(remoteContent);
         state.lastKnownEtag = remoteInfo.etag;
         state.lastKnownRemoteMtime = remoteInfo.lastModified;
+        state.lastKnownLocalMtime = file.stat.mtime;
         state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
         this.state.files[file.path] = state;
         await this.savePluginData();
@@ -1090,7 +2151,14 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         throw await this.handleWebDavError(response, file.path);
       }
       this.logDebug(`Uploaded: ${remotePath}`);
-      await this.updateStateAfterUpload(client, file.path, remotePath, localHash, state);
+      await this.updateStateAfterUpload(
+        client,
+        file.path,
+        remotePath,
+        localHash,
+        file.stat.mtime,
+        state
+      );
       this.setFileStatus(file.path, "synced");
       await this.appendChangelogEntry(file.path, reason);
     };
@@ -1103,7 +2171,9 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       this.logDebug(`Error: ${message}`);
       new import_obsidian2.Notice(`Nextcloud sync error: ${message}`);
     } finally {
-      this.currentSyncPath = null;
+      if (!this.lockStatusPath) {
+        this.currentSyncPath = null;
+      }
     }
   }
   async checkRemoteForPath(path, reason) {
@@ -1121,27 +2191,23 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       this.logDebug(`Skip (out of scope): ${path}`);
       return;
     }
-    this.currentSyncPath = path;
+    if (!this.lockStatusPath) {
+      this.currentSyncPath = path;
+    }
     this.setStatus("syncing");
     const client = this.getClientOrNotice();
     if (!client) return;
     const remotePath = this.buildRemotePath(file.path);
-    let localContent = await this.app.vault.read(file);
-    const taskResult = await this.syncTasksForFile(file, localContent);
-    if (taskResult.changed) {
-      localContent = taskResult.content;
-      this.suppressModifyForPaths.add(file.path);
-      await this.app.vault.modify(file, localContent);
-    }
-    const localHash = await hashString(localContent);
     const state = this.state.files[file.path] ?? {
       vaultPath: file.path,
       lastSyncedHash: null,
       lastKnownEtag: null,
       lastSyncTimestamp: null,
-      lastKnownRemoteMtime: null
+      lastKnownRemoteMtime: null,
+      lastKnownLocalMtime: null
     };
     const checkAttempt = async () => {
+      let localContent = null;
       let remoteInfo = null;
       try {
         remoteInfo = await client.propfind(remotePath);
@@ -1154,14 +2220,26 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         throw error;
       }
       if (!remoteInfo) return;
+      const localMtime = file.stat.mtime;
+      const lastEtag = normalizeEtag(state.lastKnownEtag);
+      const remoteEtag = normalizeEtag(remoteInfo.etag);
+      const remoteChanged = !!lastEtag && !!remoteEtag && lastEtag !== remoteEtag;
       if (!state.lastSyncedHash) {
+        localContent = await this.app.vault.read(file);
+        const taskResult = await this.syncTasksForFile(file, localContent);
+        if (taskResult.changed) {
+          localContent = taskResult.content;
+          this.suppressModifyForPaths.add(file.path);
+          await this.app.vault.modify(file, localContent);
+        }
+        const localHash2 = await hashString(localContent);
         const response2 = await client.get(remotePath);
         if (!response2.ok) {
           throw await this.handleWebDavError(response2, file.path);
         }
         const remoteContent2 = await response2.text();
         const remoteHash = await hashString(remoteContent2);
-        if (remoteHash !== localHash) {
+        if (remoteHash !== localHash2) {
           const conflictPath = await this.createConflictCopy(file, localContent);
           await this.storeConflict(file.path, conflictPath, remotePath, remoteInfo.etag);
           this.setStatus("conflict");
@@ -1169,21 +2247,36 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
           this.logDebug(`Conflict (check initial): ${file.path}`);
           return;
         }
-        state.lastSyncedHash = localHash;
+        state.lastSyncedHash = localHash2;
         state.lastKnownEtag = remoteInfo.etag;
         state.lastKnownRemoteMtime = remoteInfo.lastModified;
+        state.lastKnownLocalMtime = file.stat.mtime;
         state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
         this.state.files[file.path] = state;
         await this.savePluginData();
         return;
       }
-      const lastEtag = normalizeEtag(state.lastKnownEtag);
-      const remoteEtag = normalizeEtag(remoteInfo.etag);
-      const remoteChanged = !!lastEtag && !!remoteEtag && lastEtag !== remoteEtag;
       if (!remoteChanged) return;
-      const localChanged = state.lastSyncedHash !== localHash;
+      const canUseMtime = state.lastKnownLocalMtime !== null;
+      const localChangedByMtime = canUseMtime && localMtime !== state.lastKnownLocalMtime;
+      let localHash = state.lastSyncedHash ?? null;
+      let localChanged = localChangedByMtime;
+      if (!canUseMtime || localChangedByMtime) {
+        localContent = await this.app.vault.read(file);
+        const taskResult = await this.syncTasksForFile(file, localContent);
+        if (taskResult.changed) {
+          localContent = taskResult.content;
+          this.suppressModifyForPaths.add(file.path);
+          await this.app.vault.modify(file, localContent);
+        }
+        localHash = await hashString(localContent);
+        localChanged = state.lastSyncedHash !== localHash;
+      }
       if (localChanged) {
-        const conflictPath = await this.createConflictCopy(file, localContent);
+        const conflictPath = await this.createConflictCopy(
+          file,
+          localContent ?? await this.app.vault.read(file)
+        );
         await this.storeConflict(file.path, conflictPath, remotePath, remoteInfo.etag);
         this.setStatus("conflict");
         this.setFileStatus(file.path, "conflict");
@@ -1198,9 +2291,11 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       const remoteContent = await response.text();
       this.suppressModifyForPaths.add(file.path);
       await this.app.vault.modify(file, remoteContent);
+      await this.reconcileTaskOwnership(file, remoteContent);
       state.lastSyncedHash = await hashString(remoteContent);
       state.lastKnownEtag = remoteInfo.etag;
       state.lastKnownRemoteMtime = remoteInfo.lastModified;
+      state.lastKnownLocalMtime = file.stat.mtime;
       state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
       this.state.files[file.path] = state;
       await this.savePluginData();
@@ -1216,7 +2311,89 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       this.logDebug(`Error (check): ${message}`);
       new import_obsidian2.Notice(`Nextcloud sync error: ${message}`);
     } finally {
+      if (!this.lockStatusPath) {
+        this.currentSyncPath = null;
+      }
+    }
+  }
+  async syncRemoteNewFiles(reason) {
+    const client = this.getClientOrNotice();
+    if (!client) return;
+    const isPeriodic = reason === "periodic";
+    const hadQueue = this.queueRunning || this.queue.length > 0;
+    const showStatus = !isPeriodic;
+    const showNotices = reason.startsWith("manual");
+    if (!hadQueue && showStatus) {
+      this.currentSyncPath = "remote scan";
+      this.setStatus("syncing");
+    }
+    const remoteRoot = this.settings.remoteRoot.replace(/^\/+|\/+$/g, "");
+    const remoteRootPrefix = remoteRoot ? `${remoteRoot}/` : "";
+    const remoteConflictRoot = this.settings.conflictArchiveRemoteFolder.replace(/^\/+|\/+$/g, "");
+    let entries;
+    try {
+      entries = await client.list(remoteRoot, "infinity");
+    } catch (error) {
+      const message = this.describeError(error);
+      if (!isPeriodic) {
+        this.setStatus("error");
+      }
+      this.logDebug(`Error (list remote): ${message}`);
+      if (showNotices) {
+        new import_obsidian2.Notice(`Nextcloud sync error: ${message}`);
+      }
+      return;
+    }
+    let downloaded = 0;
+    let failed = 0;
+    for (const entry of entries) {
+      if (entry.isCollection) continue;
+      if (!entry.path.endsWith(".md")) continue;
+      if (remoteRoot && entry.path === remoteRoot) continue;
+      if (remoteConflictRoot) {
+        if (entry.path === remoteConflictRoot || entry.path.startsWith(`${remoteConflictRoot}/`)) {
+          continue;
+        }
+      }
+      if (remoteRoot && !entry.path.startsWith(remoteRootPrefix)) continue;
+      const localPath = remoteRoot ? entry.path.slice(remoteRootPrefix.length) : entry.path;
+      if (!localPath) continue;
+      if (!this.isPathInScope(localPath)) continue;
+      if (this.app.vault.getAbstractFileByPath(localPath)) continue;
+      try {
+        this.addProgressTotal(1);
+        if (!this.lockStatusPath) {
+          this.currentSyncPath = localPath;
+        }
+        await this.downloadRemoteFile(
+          client,
+          entry.path,
+          localPath,
+          entry.etag ?? null,
+          entry.lastModified ?? null,
+          reason
+        );
+        downloaded += 1;
+      } catch (error) {
+        failed += 1;
+        this.logDebug(`Download failed: ${entry.path} (${this.describeError(error)})`);
+      } finally {
+        this.markProgressDone(1);
+      }
+    }
+    if (downloaded > 0) {
+      if (showNotices) {
+        new import_obsidian2.Notice(`Nextcloud sync: downloaded ${downloaded} remote file(s).`);
+      }
+    }
+    if (failed > 0) {
+      if (showNotices) {
+        new import_obsidian2.Notice("Nextcloud sync: some remote files could not be downloaded. Check sync log.");
+      }
+    }
+    if (!hadQueue && showStatus) {
       this.currentSyncPath = null;
+      this.updateIdleStatus();
     }
   }
   showSyncQueue() {
@@ -1410,8 +2587,28 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     const user = encodeURIComponent(this.settings.username);
     return `${base}/calendars/${user}/`;
   }
-  async syncTasksForFile(file, content) {
-    if (!this.settings.enableTaskSync || !this.settings.taskSyncOnFileSync) {
+  findLockedTaskUid(filePath, normalizedLine) {
+    if (!normalizedLine) return null;
+    for (const state of Object.values(this.state.tasks)) {
+      if (state.filePath !== filePath) continue;
+      const normalizedState = stripTaskUid(state.lastSyncedLine);
+      if (normalizedState === normalizedLine) {
+        return state.uid;
+      }
+    }
+    return null;
+  }
+  async syncTasksForFile(file, content, options) {
+    if (this.isNoTaskSync(file.path)) {
+      return { content, changed: false };
+    }
+    if (this.settings.taskInboxEnabled) {
+      const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+      if (file.path === archivePath) {
+        return { content, changed: false };
+      }
+    }
+    if (!this.settings.enableTaskSync || !this.settings.taskSyncOnFileSync && !options?.force) {
       return { content, changed: false };
     }
     if (this.state.conflicts[file.path]) {
@@ -1424,6 +2621,8 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     if (!client) return { content, changed: false };
     const calendarUrl = this.normalizeCalendarUrl(this.settings.taskListUrl);
     const remoteTasks = await this.fetchRemoteTasks(client, calendarUrl);
+    const cleanupMode = options?.cleanup ?? false;
+    const remoteIndex = cleanupMode ? buildRemoteTaskIndex(remoteTasks) : null;
     const useTasksPlugin = this.isTasksPluginEnabled();
     const lines = content.split(/\r?\n/);
     const tasks = parseTaskLines(lines, { useTasksPlugin });
@@ -1431,10 +2630,58 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     let changed = false;
     const seenUids = /* @__PURE__ */ new Set();
     for (const task of tasks) {
+      const normalizedLine = stripTaskUid(task.raw);
+      const lockedUid = this.findLockedTaskUid(file.path, normalizedLine);
+      if (lockedUid && task.uid !== lockedUid) {
+        const lockedLine = buildTaskLine({
+          prefix: task.prefix,
+          checked: task.checked,
+          summary: task.summary,
+          tags: task.tags,
+          meta: task.meta,
+          uid: lockedUid,
+          statusSymbol: task.statusSymbol,
+          useTasksPlugin
+        });
+        lines[task.lineIndex] = lockedLine;
+        task.uid = lockedUid;
+        changed = true;
+      }
       let uid = task.uid;
       const summary = task.summary;
       const checked = task.checked;
       if (!uid) {
+        if (cleanupMode) {
+          const matched = popRemoteMatch(remoteIndex, summary, checked);
+          if (matched) {
+            uid = matched.uid;
+            const updatedLine = buildTaskLine({
+              prefix: task.prefix,
+              checked,
+              summary,
+              tags: task.tags,
+              meta: task.meta,
+              uid,
+              statusSymbol: task.statusSymbol,
+              useTasksPlugin
+            });
+            lines[task.lineIndex] = updatedLine;
+            this.state.tasks[uid] = {
+              uid,
+              filePath: file.path,
+              lastSyncedLine: updatedLine,
+              lastRemoteModified: matched.lastModified,
+              lastRemoteEtag: matched.etag
+            };
+            changed = true;
+            seenUids.add(uid);
+            continue;
+          }
+          continue;
+        }
+        if (!summary.trim()) {
+          continue;
+        }
         uid = generateUid();
         const newLine = buildTaskLine({
           prefix: task.prefix,
@@ -1500,16 +2747,50 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       }
       if (localChanged) {
         if (remoteChanged) {
-          new import_obsidian2.Notice(`Task conflict for ${uid}. Keeping local.`);
+          const localMtime = file.stat.mtime;
+          const remoteMtime = remote?.lastModified ? Date.parse(remote.lastModified) : Number.NaN;
+          const keepRemote = !Number.isFinite(remoteMtime) || remoteMtime > localMtime;
+          if (keepRemote && remote) {
+            const updatedLine = buildTaskLine({
+              prefix: task.prefix,
+              checked: remote.completed,
+              summary: remote.summary,
+              tags: remote.categories,
+              meta: mapRemoteToTaskMeta(remote),
+              uid,
+              statusSymbol: task.statusSymbol,
+              useTasksPlugin
+            });
+            lines[task.lineIndex] = updatedLine;
+            changed = true;
+            this.state.tasks[uid] = {
+              uid,
+              filePath: file.path,
+              lastSyncedLine: updatedLine,
+              lastRemoteModified: remote.lastModified,
+              lastRemoteEtag: remote.etag
+            };
+          } else {
+            await this.updateRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin, remote.etag);
+            this.state.tasks[uid] = {
+              uid,
+              filePath: file.path,
+              lastSyncedLine: localLine,
+              lastRemoteModified: remote.lastModified,
+              lastRemoteEtag: remote.etag
+            };
+          }
+          new import_obsidian2.Notice(`Task conflict for ${uid}. Kept newest change.`);
+        } else {
+          await this.updateRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin, remote.etag);
+          this.state.tasks[uid] = {
+            uid,
+            filePath: file.path,
+            lastSyncedLine: localLine,
+            lastRemoteModified: remote.lastModified,
+            lastRemoteEtag: remote.etag
+          };
         }
-        await this.updateRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin, remote.etag);
-        this.state.tasks[uid] = {
-          uid,
-          filePath: file.path,
-          lastSyncedLine: localLine,
-          lastRemoteModified: remote.lastModified,
-          lastRemoteEtag: remote.etag
-        };
       } else if (!remoteChanged) {
         this.state.tasks[uid] = {
           uid,
@@ -1521,9 +2802,29 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       }
     }
     for (const [uid, state] of Object.entries(this.state.tasks)) {
-      if (state.filePath === file.path && !seenUids.has(uid)) {
+      if (state.filePath !== file.path || seenUids.has(uid)) continue;
+      if (this.suppressTaskDeletePrompt.has(uid)) {
+        this.suppressTaskDeletePrompt.delete(uid);
         delete this.state.tasks[uid];
+        continue;
       }
+      if (this.settings.taskInboxEnabled) {
+        const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+        if (file.path === archivePath) {
+          delete this.state.tasks[uid];
+          continue;
+        }
+      }
+      const remote = remoteTasks.get(uid) ?? null;
+      if (!cleanupMode && remote) {
+        const choice = await this.promptTaskDeletion(uid, remote.summary);
+        if (choice === "delete") {
+          await this.deleteRemoteTask(client, remote);
+        } else if (choice === "complete") {
+          await this.completeRemoteTask(client, calendarUrl, remote, useTasksPlugin);
+        }
+      }
+      delete this.state.tasks[uid];
     }
     await this.savePluginData();
     return { content: lines.join("\n"), changed };
@@ -1578,6 +2879,47 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       });
     }
     return tasks;
+  }
+  async promptTaskDeletion(uid, summary) {
+    if (!this.settings.taskDeletionPromptEnabled) {
+      return this.settings.taskDeletionDefaultAction;
+    }
+    return await new Promise((resolve) => {
+      new TaskDeleteModal(this.app, uid, summary, resolve).open();
+    });
+  }
+  async deleteRemoteTask(client, remote) {
+    const headers = {};
+    if (remote.etag) {
+      headers["If-Match"] = remote.etag;
+    }
+    const response = await client.deleteAbsolute(remote.href, headers);
+    if (!response.ok && response.status !== 404) {
+      throw await this.handleWebDavError(response, remote.href);
+    }
+  }
+  async completeRemoteTask(client, calendarUrl, remote, useTasksPlugin) {
+    const taskLine = {
+      lineIndex: 0,
+      raw: "",
+      checked: true,
+      summary: remote.summary,
+      uid: remote.uid,
+      prefix: "- ",
+      statusSymbol: "x",
+      tags: remote.categories ?? [],
+      meta: mapRemoteToTaskMeta(remote)
+    };
+    await this.updateRemoteTask(
+      client,
+      calendarUrl,
+      remote.uid,
+      remote.summary,
+      true,
+      taskLine,
+      useTasksPlugin,
+      remote.etag
+    );
   }
   async createRemoteTask(client, calendarUrl, uid, summary, completed, task, useTasksPlugin) {
     const url = `${calendarUrl.replace(/\/+$/, "/")}${uid}.ics`;
@@ -1714,7 +3056,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       throw await this.handleWebDavError(response, current);
     }
   }
-  async updateStateAfterUpload(client, vaultPath, remotePath, localHash, state) {
+  async updateStateAfterUpload(client, vaultPath, remotePath, localHash, localMtime, state) {
     let updatedEtag = state.lastKnownEtag;
     let updatedMtime = state.lastKnownRemoteMtime;
     try {
@@ -1726,9 +3068,48 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     state.lastSyncedHash = localHash;
     state.lastKnownEtag = updatedEtag;
     state.lastKnownRemoteMtime = updatedMtime;
+    state.lastKnownLocalMtime = localMtime;
     state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
     this.state.files[vaultPath] = state;
     await this.savePluginData();
+  }
+  async updateStateAfterDownload(vaultPath, content, remoteEtag, remoteMtime, localMtime) {
+    const state = this.state.files[vaultPath] ?? {
+      vaultPath,
+      lastSyncedHash: null,
+      lastKnownEtag: null,
+      lastSyncTimestamp: null,
+      lastKnownRemoteMtime: null,
+      lastKnownLocalMtime: null
+    };
+    state.lastSyncedHash = await hashString(content);
+    state.lastKnownEtag = remoteEtag;
+    state.lastKnownRemoteMtime = remoteMtime;
+    state.lastKnownLocalMtime = localMtime;
+    state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
+    this.state.files[vaultPath] = state;
+    await this.savePluginData();
+  }
+  async downloadRemoteFile(client, remotePath, localPath, remoteEtag, remoteMtime, reason) {
+    const response = await client.get(remotePath);
+    if (!response.ok) {
+      throw await this.handleWebDavError(response, localPath);
+    }
+    const content = await response.text();
+    const folder = localPath.split("/").slice(0, -1).join("/");
+    await this.ensureLocalFolder(folder);
+    this.suppressModifyForPaths.add(localPath);
+    const created = await this.app.vault.create(localPath, content);
+    await this.reconcileTaskOwnership(created, content);
+    await this.updateStateAfterDownload(
+      localPath,
+      content,
+      remoteEtag,
+      remoteMtime,
+      created.stat.mtime
+    );
+    this.setFileStatus(localPath, "synced");
+    this.logDebug(`Downloaded (new): ${remotePath}`);
   }
   async handleWebDavError(response, target) {
     const message = response.status === 401 || response.status === 403 ? "Authentication failed. Check username/app password." : `Request failed for ${target} (${response.status} ${response.statusText})`;
@@ -1834,9 +3215,17 @@ ${entry}`);
       lastSyncedHash: null,
       lastKnownEtag: null,
       lastSyncTimestamp: null,
-      lastKnownRemoteMtime: null
+      lastKnownRemoteMtime: null,
+      lastKnownLocalMtime: null
     };
-    await this.updateStateAfterUpload(client, file.path, conflict.remotePath, localHash, state);
+    await this.updateStateAfterUpload(
+      client,
+      file.path,
+      conflict.remotePath,
+      localHash,
+      file.stat.mtime,
+      state
+    );
     if (this.settings.archiveConflictsOnResolve) {
       await this.archiveConflictCopy(conflict, client);
     } else {
@@ -1876,11 +3265,13 @@ ${entry}`);
       lastSyncedHash: null,
       lastKnownEtag: null,
       lastSyncTimestamp: null,
-      lastKnownRemoteMtime: null
+      lastKnownRemoteMtime: null,
+      lastKnownLocalMtime: null
     };
     state.lastSyncedHash = await hashString(remoteContent);
     state.lastKnownEtag = etag;
     state.lastKnownRemoteMtime = mtime;
+    state.lastKnownLocalMtime = file.stat.mtime;
     state.lastSyncTimestamp = (/* @__PURE__ */ new Date()).toISOString();
     this.state.files[file.path] = state;
     if (this.settings.archiveConflictsOnResolve) {
@@ -1899,24 +3290,19 @@ ${entry}`);
     if (!(conflictFile instanceof import_obsidian2.TFile)) {
       return;
     }
-    const archiveFolder = this.settings.conflictArchiveFolder.trim();
-    const archiveRoot = archiveFolder.replace(/\/+$/, "");
-    if (!archiveRoot) return;
-    const fileName = conflictFile.name;
-    const archivePath = await this.getUniqueArchivePath(archiveRoot, fileName);
-    await this.ensureLocalFolder(archiveRoot);
     const conflictContent = await this.app.vault.read(conflictFile);
-    await this.app.vault.rename(conflictFile, archivePath);
     const remoteArchiveRoot = this.settings.conflictArchiveRemoteFolder.replace(/^\/+|\/+$/g, "");
-    if (!remoteArchiveRoot) return;
-    const remoteArchivePath = `${remoteArchiveRoot}/${getFileName(archivePath)}`;
-    await this.ensureRemoteFolders(client, remoteArchivePath);
-    const response = await client.put(remoteArchivePath, conflictContent, {
-      "If-None-Match": "*"
-    });
-    if (!response.ok && response.status !== 405 && response.status !== 409) {
-      this.logDebug(`Archive upload failed: ${remoteArchivePath} (${response.status})`);
+    if (remoteArchiveRoot) {
+      const remoteArchivePath = `${remoteArchiveRoot}/${conflictFile.name}`;
+      await this.ensureRemoteFolders(client, remoteArchivePath);
+      const response = await client.put(remoteArchivePath, conflictContent, {
+        "If-None-Match": "*"
+      });
+      if (!response.ok && response.status !== 405 && response.status !== 409) {
+        this.logDebug(`Archive upload failed: ${remoteArchivePath} (${response.status})`);
+      }
     }
+    await this.deleteConflictFile(conflict.conflictPath);
   }
   async getUniqueArchivePath(folder, fileName) {
     let candidate = `${folder}/${fileName}`;
@@ -1956,6 +3342,60 @@ ${entry}`);
       await this.app.vault.delete(abstract);
     }
   }
+  async cleanupTaskIds() {
+    if (!this.settings.enableTaskSync) {
+      new import_obsidian2.Notice("Nextcloud sync: enable Task sync first.");
+      return;
+    }
+    if (!this.settings.taskListUrl) {
+      new import_obsidian2.Notice("Nextcloud sync: set Task list URL first.");
+      return;
+    }
+    new import_obsidian2.Notice("Nextcloud sync: cleaning task IDs...");
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      if (!this.isFileInScope(file)) continue;
+      const content = await this.app.vault.read(file);
+      let updated = stripTaskUidKeepWhitespace(content);
+      const legacyMatches = Array.from(content.matchAll(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->/g));
+      if (legacyMatches.length > 0) {
+        const lines = updated.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const match = line.match(/^(\s*-\s+\[[^\]]\]\s+)(.*)$/);
+          if (!match) continue;
+          const body = match[2];
+          const legacy = body.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->/);
+          if (!legacy) continue;
+          const uid = legacy[1];
+          const cleanedBody = body.replace(/<!--\s*nc-task:[A-Za-z0-9-]+\s*-->/g, "").trim();
+          lines[i] = `${match[1]}${formatTaskUid(uid)} ${cleanedBody}`.trimEnd();
+        }
+        updated = lines.join("\n");
+      }
+      if (updated !== content) {
+        this.suppressModifyForPaths.add(file.path);
+        await this.app.vault.modify(file, updated);
+      }
+      for (const [uid, state] of Object.entries(this.state.tasks)) {
+        if (state.filePath === file.path) {
+          delete this.state.tasks[uid];
+        }
+      }
+    }
+    await this.savePluginData();
+    for (const file of files) {
+      if (!this.isFileInScope(file)) continue;
+      let content = await this.app.vault.read(file);
+      const result = await this.syncTasksForFile(file, content, { cleanup: true });
+      if (result.changed) {
+        this.suppressModifyForPaths.add(file.path);
+        await this.app.vault.modify(file, result.content);
+      }
+    }
+    await this.savePluginData();
+    new import_obsidian2.Notice("Nextcloud sync: task ID cleanup finished.");
+  }
   seedStatusesFromState() {
     for (const path of Object.keys(this.state.files)) {
       if (!this.fileStatuses.has(path)) {
@@ -1983,6 +3423,28 @@ ${entry}`);
       const item = view.fileItems?.[path];
       const container = item?.titleEl ?? item?.el;
       if (!container) continue;
+      const special = this.getSpecialNoteType(path);
+      let specialEl = container.querySelector(".nc-special-note-icon");
+      if (special) {
+        if (!specialEl) {
+          specialEl = container.createSpan({ cls: "nc-special-note-icon" });
+        } else {
+          specialEl.empty();
+        }
+        specialEl.classList.remove(
+          "nc-special-note-inbox",
+          "nc-special-note-archive",
+          "nc-special-note-today",
+          "nc-special-note-checklist"
+        );
+        specialEl.addClass(`nc-special-note-${special}`);
+        const icon2 = special === "inbox" ? "inbox" : special === "archive" ? "archive" : special === "today" ? "calendar" : "check-square";
+        (0, import_obsidian2.setIcon)(specialEl, icon2);
+        container.addClass("nc-special-note");
+      } else {
+        container.removeClass("nc-special-note");
+        if (specialEl) specialEl.remove();
+      }
       let iconEl = container.querySelector(".sync-status-icon");
       if (!status) {
         if (iconEl) iconEl.remove();
@@ -2000,6 +3462,23 @@ ${entry}`);
       iconEl.setAttr("aria-label", `Sync status: ${status}`);
       iconEl.setAttr("title", `Sync status: ${status}`);
     }
+  }
+  getSpecialNoteType(path) {
+    if (this.settings.taskInboxEnabled) {
+      const inboxPath = this.settings.taskInboxPath.trim() || "Task Inbox.md";
+      const archivePath = this.settings.taskInboxArchivePath.trim() || "Task Inbox closed.md";
+      if (path === inboxPath) return "inbox";
+      if (path === archivePath) return "archive";
+    }
+    if (this.settings.todayNoteEnabled) {
+      const todayPath = this.resolvePathTemplate(this.settings.todayNotePath.trim() || "Today.md");
+      if (path === todayPath) return "today";
+    }
+    if (this.settings.dailyChecklistEnabled) {
+      const checklistPath = this.resolvePathTemplate(this.settings.dailyChecklistPath.trim() || "Daily Checklist.md");
+      if (path === checklistPath) return "checklist";
+    }
+    return null;
   }
   applyStatusStyles() {
     const style = document.createElement("style");
@@ -2025,9 +3504,101 @@ ${entry}`);
   line-height: 1;
   flex: 0 0 auto;
 }
+.nc-special-note-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  opacity: 0.85;
+  vertical-align: middle;
+}
+.nc-special-note-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.nc-special-note {
+  color: var(--text-accent);
+}
+.nc-special-note-icon.nc-special-note-inbox {
+  color: var(--color-green);
+}
+.nc-special-note-icon.nc-special-note-archive {
+  color: var(--color-orange);
+}
+.nc-special-note-icon.nc-special-note-today {
+  color: var(--color-blue);
+}
+.nc-special-note-icon.nc-special-note-checklist {
+  color: var(--color-yellow);
+}
+.nc-task-synced-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  opacity: 0.6;
+  vertical-align: middle;
+}
+.nc-task-synced-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.nc-sync-ribbon-spacer {
+  margin: 6px 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.nc-sync-ribbon-icon {
+  margin-top: 2px;
+}
+.nc-modal-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.nc-modal-label {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.nc-modal-summary {
+  min-height: 90px;
+  resize: vertical;
+  width: 100%;
+}
 `;
     document.head.appendChild(style);
     this.register(() => style.remove());
+  }
+  addRibbonSeparator() {
+    const ribbon = this.app.workspace.leftRibbonEl;
+    if (!ribbon) return;
+    const spacer = ribbon.createDiv({ cls: "nc-sync-ribbon-spacer" });
+    this.register(() => spacer.remove());
+  }
+  addRibbonAction(icon, title, callback) {
+    const el = this.addRibbonIcon(icon, title, callback);
+    el.addClass("nc-sync-ribbon-icon");
+  }
+  registerTaskIdIconProcessor() {
+    this.registerMarkdownPostProcessor((el) => {
+      const touched = /* @__PURE__ */ new Set();
+      const listItems = Array.from(el.querySelectorAll("li"));
+      for (const li of listItems) {
+        if (touched.has(li)) continue;
+        if (!li.textContent?.includes("\u{1F194}")) continue;
+        touched.add(li);
+        let icon = li.querySelector(".nc-task-synced-icon");
+        if (!icon) {
+          icon = document.createElement("span");
+          icon.className = "nc-task-synced-icon";
+          (0, import_obsidian2.setIcon)(icon, "check-circle");
+          const checkbox = li.querySelector('input[type="checkbox"]');
+          if (checkbox) {
+            checkbox.insertAdjacentElement("afterend", icon);
+          } else {
+            li.insertBefore(icon, li.firstChild);
+          }
+        }
+      }
+    });
   }
 };
 var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
@@ -2040,6 +3611,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Nextcloud Sync Suite" });
+    containerEl.createEl("h3", { text: "Connection" });
     new import_obsidian2.Setting(containerEl).setName("Nextcloud base URL").setDesc("Base URL of your Nextcloud (e.g., https://cloud.example.com)").addText(
       (text) => text.setPlaceholder("https://cloud.example.com").setValue(this.plugin.settings.nextcloudBaseUrl).onChange(async (value) => {
         this.plugin.settings.nextcloudBaseUrl = value.trim();
@@ -2064,6 +3636,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    containerEl.createEl("h3", { text: "Sync Behavior" });
     new import_obsidian2.Setting(containerEl).setName("Debounce (ms)").setDesc("Delay before syncing after edits").addText(
       (text) => text.setPlaceholder("900").setValue(String(this.plugin.settings.debounceMs)).onChange(async (value) => {
         const parsed = Number.parseInt(value, 10);
@@ -2107,6 +3680,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    containerEl.createEl("h3", { text: "Remote Checks" });
     new import_obsidian2.Setting(containerEl).setName("Periodic remote check").setDesc("Check remote changes for all in-scope notes every N minutes").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.periodicRemoteCheckEnabled).onChange(async (value) => {
         this.plugin.settings.periodicRemoteCheckEnabled = value;
@@ -2122,6 +3696,12 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         this.plugin.setupPeriodicRemoteCheck();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("Periodic check notices").setDesc("Show a notice when a periodic check starts and finishes").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.periodicRemoteCheckNotices).onChange(async (value) => {
+        this.plugin.settings.periodicRemoteCheckNotices = value;
+        await this.plugin.savePluginData();
+      })
+    );
     new import_obsidian2.Setting(containerEl).setName("Focus check throttle (ms)").setDesc("Minimum delay between focus-triggered checks per file").addText(
       (text) => text.setPlaceholder("2000").setValue(String(this.plugin.settings.focusCheckThrottleMs)).onChange(async (value) => {
         const parsed = Number.parseInt(value, 10);
@@ -2129,6 +3709,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    containerEl.createEl("h3", { text: "Deletes" });
     new import_obsidian2.Setting(containerEl).setName("Prompt to delete remote file").setDesc("When deleting a synced file locally, ask to delete it on the server too").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.promptRemoteDelete).onChange(async (value) => {
         this.plugin.settings.promptRemoteDelete = value;
@@ -2147,6 +3728,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    containerEl.createEl("h3", { text: "Task Sync" });
     new import_obsidian2.Setting(containerEl).setName("Task sync").setDesc("Sync Markdown checkboxes with Nextcloud Tasks").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enableTaskSync).onChange(async (value) => {
         this.plugin.settings.enableTaskSync = value;
@@ -2183,6 +3765,165 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("Task sync interval").setDesc("Sync tasks from Nextcloud on a fixed interval").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.taskSyncIntervalEnabled).onChange(async (value) => {
+        this.plugin.settings.taskSyncIntervalEnabled = value;
+        await this.plugin.savePluginData();
+        this.plugin.setupTaskSyncInterval();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Task sync interval (minutes)").setDesc("How often to pull task updates from Nextcloud").addText(
+      (text) => text.setPlaceholder("10").setValue(String(this.plugin.settings.taskSyncIntervalMinutes)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        this.plugin.settings.taskSyncIntervalMinutes = Number.isFinite(parsed) ? Math.max(1, parsed) : 10;
+        await this.plugin.savePluginData();
+        this.plugin.setupTaskSyncInterval();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Task deletion prompt").setDesc("Ask what to do when a task is removed locally").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.taskDeletionPromptEnabled).onChange(async (value) => {
+        this.plugin.settings.taskDeletionPromptEnabled = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Task deletion default action").setDesc("Used when the prompt is disabled").addDropdown(
+      (dropdown) => dropdown.addOption("delete", "Delete on server").addOption("complete", "Mark completed on server").addOption("keep", "Keep on server").setValue(this.plugin.settings.taskDeletionDefaultAction).onChange(async (value) => {
+        this.plugin.settings.taskDeletionDefaultAction = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Remote task inbox").setDesc("Append remote-only tasks to a local inbox note").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.taskInboxEnabled).onChange(async (value) => {
+        this.plugin.settings.taskInboxEnabled = value;
+        if (value) {
+          const inboxPath = this.plugin.settings.taskInboxPath.trim() || "Task Inbox.md";
+          this.plugin.state.noSync[inboxPath] = true;
+          delete this.plugin.state.noTaskSync[inboxPath];
+        }
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Remote task inbox path").setDesc("Note path to store remote-only tasks").addText(
+      (text) => text.setPlaceholder("Task Inbox.md").setValue(this.plugin.settings.taskInboxPath).onChange(async (value) => {
+        this.plugin.settings.taskInboxPath = value.trim() || "Task Inbox.md";
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Task inbox archive path").setDesc("Note path to archive completed inbox tasks").addText(
+      (text) => text.setPlaceholder("Task Inbox closed.md").setValue(this.plugin.settings.taskInboxArchivePath).onChange(async (value) => {
+        this.plugin.settings.taskInboxArchivePath = value.trim() || "Task Inbox closed.md";
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Remote task inbox query").setDesc("Tasks plugin query inserted into the inbox note").addTextArea(
+      (text) => text.setPlaceholder("```tasks\nnot done\n```").setValue(this.plugin.settings.taskInboxQuery).onChange(async (value) => {
+        this.plugin.settings.taskInboxQuery = value.trim();
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Auto-move tasks from inbox").setDesc("Move inbox tasks to their note when the note is downloaded").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.taskInboxAutoMove).onChange(async (value) => {
+        this.plugin.settings.taskInboxAutoMove = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    containerEl.createEl("h3", { text: "Focus & Planning" });
+    new import_obsidian2.Setting(containerEl).setName("Today Focus note").setDesc("Create/update a Today Focus note").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.todayNoteEnabled).onChange(async (value) => {
+        this.plugin.settings.todayNoteEnabled = value;
+        await this.plugin.savePluginData();
+        if (value) {
+          void this.plugin.refreshTodayNote();
+        }
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Today Focus path").setDesc("Path for Today note (supports {{date}})").addText(
+      (text) => text.setPlaceholder("Today.md").setValue(this.plugin.settings.todayNotePath).onChange(async (value) => {
+        this.plugin.settings.todayNotePath = value.trim() || "Today.md";
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Today Focus task limit").setDesc("Max tasks shown in Today Focus").addText(
+      (text) => text.setPlaceholder("4").setValue(String(this.plugin.settings.todayNoteLimit)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        this.plugin.settings.todayNoteLimit = Number.isFinite(parsed) ? Math.max(1, parsed) : 4;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Today Focus uses Tasks query").setDesc("Use Tasks plugin query block for Today Focus").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.todayNoteUseQuery).onChange(async (value) => {
+        this.plugin.settings.todayNoteUseQuery = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Today Focus query").setDesc("Tasks query inserted into Today note (supports {{limit}})").addTextArea(
+      (text) => text.setPlaceholder("```tasks\\nnot done\\nlimit {{limit}}\\nsort by due\\n```").setValue(this.plugin.settings.todayNoteQuery).onChange(async (value) => {
+        this.plugin.settings.todayNoteQuery = value.trim();
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Task reminders").setDesc("Show gentle reminders for overdue or due-today tasks").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.remindersEnabled).onChange(async (value) => {
+        this.plugin.settings.remindersEnabled = value;
+        await this.plugin.savePluginData();
+        this.plugin.setupReminders();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Reminder interval (minutes)").setDesc("How often to check for due tasks").addText(
+      (text) => text.setPlaceholder("60").setValue(String(this.plugin.settings.remindersMinutes)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        this.plugin.settings.remindersMinutes = Number.isFinite(parsed) ? Math.max(5, parsed) : 60;
+        await this.plugin.savePluginData();
+        this.plugin.setupReminders();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Reminder mode").setDesc("Which tasks to remind about").addDropdown(
+      (dropdown) => dropdown.addOption("overdue", "Overdue only").addOption("today", "Due today only").addOption("both", "Overdue + due today").setValue(this.plugin.settings.remindersMode).onChange(async (value) => {
+        this.plugin.settings.remindersMode = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Reminder max count").setDesc("Maximum tasks mentioned per reminder").addText(
+      (text) => text.setPlaceholder("3").setValue(String(this.plugin.settings.remindersMaxCount)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        this.plugin.settings.remindersMaxCount = Number.isFinite(parsed) ? Math.max(1, parsed) : 3;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Daily checklist").setDesc("Create/reset a daily checklist note").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.dailyChecklistEnabled).onChange(async (value) => {
+        this.plugin.settings.dailyChecklistEnabled = value;
+        await this.plugin.savePluginData();
+        if (value) {
+          void this.plugin.refreshDailyChecklist();
+        }
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Daily checklist path").setDesc("Path for daily checklist (supports {{date}})").addText(
+      (text) => text.setPlaceholder("Daily Checklist.md").setValue(this.plugin.settings.dailyChecklistPath).onChange(async (value) => {
+        this.plugin.settings.dailyChecklistPath = value.trim() || "Daily Checklist.md";
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Daily checklist template").setDesc("Content inserted when checklist resets").addTextArea(
+      (text) => text.setPlaceholder("- [ ] Plan top 3 tasks").setValue(this.plugin.settings.dailyChecklistTemplate).onChange(async (value) => {
+        this.plugin.settings.dailyChecklistTemplate = value;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Quick capture path").setDesc("Note to append quick-captured tasks").addText(
+      (text) => text.setPlaceholder("Task Inbox.md").setValue(this.plugin.settings.quickCapturePath).onChange(async (value) => {
+        this.plugin.settings.quickCapturePath = value.trim() || "Task Inbox.md";
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Focus tag").setDesc("Optional tag used by focus workflows").addText(
+      (text) => text.setPlaceholder("focus").setValue(this.plugin.settings.focusTag).onChange(async (value) => {
+        this.plugin.settings.focusTag = value.trim() || "focus";
+        await this.plugin.savePluginData();
+      })
+    );
+    containerEl.createEl("h3", { text: "Changelog & Debug" });
     new import_obsidian2.Setting(containerEl).setName("Local changelog").setDesc("Append sync entries to a local note").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enableChangelog).onChange(async (value) => {
         this.plugin.settings.enableChangelog = value;
@@ -2201,6 +3942,7 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    containerEl.createEl("h3", { text: "Conflicts" });
     new import_obsidian2.Setting(containerEl).setName("Archive conflicts on resolve").setDesc("Move conflict copies to an archive folder and upload them to the server").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.archiveConflictsOnResolve).onChange(async (value) => {
         this.plugin.settings.archiveConflictsOnResolve = value;
@@ -2264,6 +4006,135 @@ var SyncLogModal = class extends import_obsidian2.Modal {
     }
     const pre = contentEl.createEl("pre");
     pre.setText(this.entries.join("\n"));
+  }
+};
+var TaskDeleteModal = class extends import_obsidian2.Modal {
+  uid;
+  summary;
+  onChoice;
+  constructor(app, uid, summary, onChoice) {
+    super(app);
+    this.uid = uid;
+    this.summary = summary;
+    this.onChoice = onChoice;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Task removed locally" });
+    contentEl.createEl("p", { text: this.summary || this.uid });
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const deleteButton = buttons.createEl("button", { text: "Delete on server" });
+    deleteButton.addEventListener("click", () => {
+      this.onChoice("delete");
+      this.close();
+    });
+    const completeButton = buttons.createEl("button", { text: "Mark completed on server" });
+    completeButton.addEventListener("click", () => {
+      this.onChoice("complete");
+      this.close();
+    });
+    const keepButton = buttons.createEl("button", { text: "Keep on server" });
+    keepButton.addEventListener("click", () => {
+      this.onChoice("keep");
+      this.close();
+    });
+  }
+};
+var QuickCaptureModal = class extends import_obsidian2.Modal {
+  onSubmit;
+  constructor(app, onSubmit) {
+    super(app);
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Quick capture task" });
+    const summaryLabel = contentEl.createEl("label", { text: "Summary" });
+    summaryLabel.className = "nc-modal-label";
+    const summaryInput = contentEl.createEl("textarea");
+    summaryInput.className = "nc-modal-summary";
+    summaryInput.placeholder = "Task summary";
+    summaryInput.focus();
+    const fieldWrap = contentEl.createDiv({ cls: "nc-modal-fields" });
+    const checkedWrap = fieldWrap.createDiv();
+    const checkedInput = checkedWrap.createEl("input", { type: "checkbox" });
+    const checkedLabel = checkedWrap.createEl("label", { text: "Completed" });
+    checkedLabel.className = "nc-modal-label";
+    checkedLabel.style.marginLeft = "6px";
+    const dueLabel = fieldWrap.createEl("label", { text: "Due date" });
+    dueLabel.className = "nc-modal-label";
+    const dueInput = fieldWrap.createEl("input", { type: "date" });
+    dueInput.placeholder = "Due date";
+    const schedLabel = fieldWrap.createEl("label", { text: "Scheduled date" });
+    schedLabel.className = "nc-modal-label";
+    const schedInput = fieldWrap.createEl("input", { type: "date" });
+    schedInput.placeholder = "Scheduled date";
+    const startLabel = fieldWrap.createEl("label", { text: "Start date" });
+    startLabel.className = "nc-modal-label";
+    const startInput = fieldWrap.createEl("input", { type: "date" });
+    startInput.placeholder = "Start date";
+    const priorityLabel = fieldWrap.createEl("label", { text: "Priority" });
+    priorityLabel.className = "nc-modal-label";
+    const prioritySelect = fieldWrap.createEl("select");
+    ["None", "High", "Medium", "Low", "Lowest"].forEach((label) => {
+      const option = prioritySelect.createEl("option");
+      option.text = label;
+      option.value = label.toLowerCase();
+    });
+    const tagsLabel = fieldWrap.createEl("label", { text: "Tags" });
+    tagsLabel.className = "nc-modal-label";
+    const tagsInput = fieldWrap.createEl("input", { type: "text" });
+    tagsInput.placeholder = "Tags (comma or #tag)";
+    const recurrenceLabel = fieldWrap.createEl("label", { text: "Recurrence" });
+    recurrenceLabel.className = "nc-modal-label";
+    const recurrenceInput = fieldWrap.createEl("input", { type: "text" });
+    recurrenceInput.placeholder = "Recurrence (optional)";
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const addButton = buttons.createEl("button", { text: "Add" });
+    const cancelButton = buttons.createEl("button", { text: "Cancel" });
+    const submit = () => {
+      const meta = emptyTaskMeta();
+      if (dueInput.value) meta.dueDate = dueInput.value;
+      if (schedInput.value) meta.scheduledDate = schedInput.value;
+      if (startInput.value) meta.startDate = startInput.value;
+      if (recurrenceInput.value.trim()) meta.recurrenceText = recurrenceInput.value.trim();
+      const checked = checkedInput.checked;
+      if (checked) meta.doneDate = formatDateOnly(/* @__PURE__ */ new Date());
+      const priorityMap = {
+        none: null,
+        high: 1,
+        medium: 3,
+        low: 7,
+        lowest: 9
+      };
+      meta.priority = priorityMap[prioritySelect.value] ?? null;
+      const tags = parseTagInput(tagsInput.value);
+      this.onSubmit({
+        summary: summaryInput.value,
+        checked,
+        tags,
+        meta,
+        statusSymbol: checked ? "x" : " "
+      });
+      this.close();
+    };
+    addButton.addEventListener("click", submit);
+    cancelButton.addEventListener("click", () => {
+      this.onSubmit(null);
+      this.close();
+    });
+    summaryInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        this.onSubmit(null);
+        this.close();
+      }
+    });
   }
 };
 var RemoteHistoryModal = class extends import_obsidian2.Modal {
@@ -2592,6 +4463,12 @@ function formatTimestamp(value) {
   const min = String(date.getMinutes()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd} ${hh}${min}`;
 }
+function formatDateOnly(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
 function safeJsonParse(value) {
   try {
     return JSON.parse(value);
@@ -2612,10 +4489,16 @@ function parseTaskLines(lines, options) {
     const checked = statusSymbol.toLowerCase() === "x";
     let summary = match[3].trim();
     let uid = null;
-    const uidMatch = summary.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->$/);
+    const uidMatch = summary.match(/^🆔\s*([A-Za-z0-9-]+)\s*/);
     if (uidMatch) {
       uid = uidMatch[1];
-      summary = summary.replace(uidMatch[0], "").trim();
+      summary = summary.replace(/^🆔\s*[A-Za-z0-9-]+\s*/, "").trim();
+    } else {
+      const legacyMatch = summary.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->/);
+      if (legacyMatch) {
+        uid = legacyMatch[1];
+        summary = summary.replace(/<!--\s*nc-task:[A-Za-z0-9-]+\s*-->/g, "").trim();
+      }
     }
     let meta = emptyTaskMeta();
     let tags = [];
@@ -2639,16 +4522,83 @@ function parseTaskLines(lines, options) {
   }
   return tasks;
 }
+function stripTaskUid(value) {
+  return value.replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ").trim();
+}
+function stripTaskUidKeepWhitespace(value) {
+  return value.replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ");
+}
+function normalizeTaskKey(summary, completed) {
+  const normalized = summary.trim().toLowerCase().replace(/\s+/g, " ");
+  return `${completed ? "1" : "0"}|${normalized}`;
+}
+function isTaskLine(line) {
+  return /^\s*-\s+\[[^\]]\]\s+/.test(line);
+}
+function findFirstTaskIndex(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (isTaskLine(lines[i])) return i;
+  }
+  return lines.length;
+}
+function compareTaskPriority(a, b) {
+  const dateA = a.meta.dueDate ?? a.meta.scheduledDate ?? a.meta.startDate ?? "";
+  const dateB = b.meta.dueDate ?? b.meta.scheduledDate ?? b.meta.startDate ?? "";
+  if (dateA && dateB && dateA !== dateB) return dateA.localeCompare(dateB);
+  if (dateA && !dateB) return -1;
+  if (!dateA && dateB) return 1;
+  const prioA = a.meta.priority ?? 99;
+  const prioB = b.meta.priority ?? 99;
+  if (prioA !== prioB) return prioA - prioB;
+  return a.summary.localeCompare(b.summary);
+}
+function parseTagInput(value) {
+  if (!value) return [];
+  const parts = value.split(/[, ]+/).map((part) => part.trim()).filter(Boolean).map((part) => part.startsWith("#") ? part.slice(1) : part);
+  return normalizeTags(parts);
+}
+function buildTaskLineNoUid(options) {
+  const { summary, checked, tags, meta, statusSymbol, useTasksPlugin } = options;
+  const prefix = "- ";
+  if (!useTasksPlugin) {
+    return `${prefix}${checked ? "[x]" : "[ ]"} ${summary}`.trimEnd();
+  }
+  const effectiveSymbol = checked ? "x" : statusSymbol === "x" || statusSymbol === "X" ? " " : statusSymbol;
+  const tagTokens = normalizeTags(tags).map((tag) => `#${tag}`).join(" ");
+  const metaTokens = formatTaskMetaTokens(meta);
+  const body = [summary, tagTokens, metaTokens].filter((part) => part && part.length > 0).join(" ").trim();
+  return `${prefix}[${effectiveSymbol}] ${body}`.trimEnd();
+}
+function buildRemoteTaskIndex(tasks) {
+  const index = /* @__PURE__ */ new Map();
+  for (const task of tasks.values()) {
+    const key = normalizeTaskKey(task.summary, task.completed);
+    const bucket = index.get(key);
+    if (bucket) {
+      bucket.push(task);
+    } else {
+      index.set(key, [task]);
+    }
+  }
+  return index;
+}
+function popRemoteMatch(index, summary, completed) {
+  if (!index) return null;
+  const key = normalizeTaskKey(summary, completed);
+  const bucket = index.get(key);
+  if (!bucket || bucket.length === 0) return null;
+  return bucket.shift() ?? null;
+}
 function formatTaskUid(uid) {
-  return `<!-- nc-task:${uid} -->`;
+  return `\u{1F194} ${uid}`;
 }
 function generateUid() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
+    const uuid = crypto.randomUUID().replace(/-/g, "");
+    return uuid.slice(0, 6);
   }
-  const random = Math.random().toString(16).slice(2);
-  const now = Date.now().toString(16);
-  return `${now}-${random}`;
+  const random = Math.random().toString(36).slice(2);
+  return random.slice(0, 6);
 }
 function buildVtodo(uid, summary, completed, task, useTasksPlugin) {
   const stamp = formatCalDate(/* @__PURE__ */ new Date());
@@ -2804,12 +4754,12 @@ function extractTasksPluginMeta(text) {
   let cleaned = text;
   const meta = emptyTaskMeta();
   const dateFields = [
-    { emoji: "📅", key: "dueDate" },
-    { emoji: "⏳", key: "scheduledDate" },
-    { emoji: "🛫", key: "startDate" },
-    { emoji: "➕", key: "createdDate" },
-    { emoji: "✅", key: "doneDate" },
-    { emoji: "❌", key: "cancelledDate" }
+    { emoji: "\u{1F4C5}", key: "dueDate" },
+    { emoji: "\u23F3", key: "scheduledDate" },
+    { emoji: "\u{1F6EB}", key: "startDate" },
+    { emoji: "\u2795", key: "createdDate" },
+    { emoji: "\u2705", key: "doneDate" },
+    { emoji: "\u274C", key: "cancelledDate" }
   ];
   for (const field of dateFields) {
     const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`);
@@ -2819,22 +4769,22 @@ function extractTasksPluginMeta(text) {
       cleaned = cleaned.replace(match[0], " ").trim();
     }
   }
-  if (cleaned.includes("⏫")) {
+  if (cleaned.includes("\u23EB")) {
     meta.priority = 1;
-    cleaned = cleaned.replace("⏫", " ").trim();
-  } else if (cleaned.includes("🔼")) {
+    cleaned = cleaned.replace("\u23EB", " ").trim();
+  } else if (cleaned.includes("\u{1F53C}")) {
     meta.priority = 3;
-    cleaned = cleaned.replace("🔼", " ").trim();
-  } else if (cleaned.includes("🔽")) {
+    cleaned = cleaned.replace("\u{1F53C}", " ").trim();
+  } else if (cleaned.includes("\u{1F53D}")) {
     meta.priority = 7;
-    cleaned = cleaned.replace("🔽", " ").trim();
-  } else if (cleaned.includes("⏬")) {
+    cleaned = cleaned.replace("\u{1F53D}", " ").trim();
+  } else if (cleaned.includes("\u23EC")) {
     meta.priority = 9;
-    cleaned = cleaned.replace("⏬", " ").trim();
+    cleaned = cleaned.replace("\u23EC", " ").trim();
   }
-  const recurrenceIndex = cleaned.indexOf("🔁");
+  const recurrenceIndex = cleaned.indexOf("\u{1F501}");
   if (recurrenceIndex !== -1) {
-    const tokenList = ["📅", "⏳", "🛫", "➕", "✅", "❌", "⏫", "🔼", "🔽", "⏬"];
+    const tokenList = ["\u{1F4C5}", "\u23F3", "\u{1F6EB}", "\u2795", "\u2705", "\u274C", "\u23EB", "\u{1F53C}", "\u{1F53D}", "\u23EC"];
     let endIndex = cleaned.length;
     for (const token of tokenList) {
       const idx = cleaned.indexOf(token, recurrenceIndex + 2);
@@ -2852,28 +4802,28 @@ function extractTasksPluginMeta(text) {
 function formatTaskMetaTokens(meta) {
   const parts = [];
   if (meta.priority) {
-    const emoji = meta.priority <= 1 ? "⏫" : meta.priority <= 3 ? "🔼" : meta.priority >= 9 ? "⏬" : "🔽";
+    const emoji = meta.priority <= 1 ? "\u23EB" : meta.priority <= 3 ? "\u{1F53C}" : meta.priority >= 9 ? "\u23EC" : "\u{1F53D}";
     parts.push(emoji);
   }
-  if (meta.dueDate) parts.push(`📅 ${meta.dueDate}`);
-  if (meta.scheduledDate) parts.push(`⏳ ${meta.scheduledDate}`);
-  if (meta.startDate) parts.push(`🛫 ${meta.startDate}`);
-  if (meta.createdDate) parts.push(`➕ ${meta.createdDate}`);
-  if (meta.doneDate) parts.push(`✅ ${meta.doneDate}`);
-  if (meta.cancelledDate) parts.push(`❌ ${meta.cancelledDate}`);
-  if (meta.recurrenceText) parts.push(`🔁 ${meta.recurrenceText}`);
+  if (meta.dueDate) parts.push(`\u{1F4C5} ${meta.dueDate}`);
+  if (meta.scheduledDate) parts.push(`\u23F3 ${meta.scheduledDate}`);
+  if (meta.startDate) parts.push(`\u{1F6EB} ${meta.startDate}`);
+  if (meta.createdDate) parts.push(`\u2795 ${meta.createdDate}`);
+  if (meta.doneDate) parts.push(`\u2705 ${meta.doneDate}`);
+  if (meta.cancelledDate) parts.push(`\u274C ${meta.cancelledDate}`);
+  if (meta.recurrenceText) parts.push(`\u{1F501} ${meta.recurrenceText}`);
   return parts.join(" ");
 }
 function buildTaskLine(options) {
   const { prefix, checked, summary, tags, meta, uid, statusSymbol, useTasksPlugin } = options;
   if (!useTasksPlugin) {
-    return `${prefix}${checked ? "[x]" : "[ ]"} ${summary} ${formatTaskUid(uid)}`.trimEnd();
+    return `${prefix}${checked ? "[x]" : "[ ]"} ${formatTaskUid(uid)} ${summary}`.trimEnd();
   }
   const effectiveSymbol = checked ? "x" : statusSymbol === "x" || statusSymbol === "X" ? " " : statusSymbol;
   const tagTokens = normalizeTags(tags).map((tag) => `#${tag}`).join(" ");
   const metaTokens = formatTaskMetaTokens(meta);
   const body = [summary, tagTokens, metaTokens].filter((part) => part && part.length > 0).join(" ").trim();
-  return `${prefix}[${effectiveSymbol}] ${body} ${formatTaskUid(uid)}`.trimEnd();
+  return `${prefix}[${effectiveSymbol}] ${formatTaskUid(uid)} ${body}`.trimEnd();
 }
 function mapRemoteToTaskMeta(remote) {
   return {
