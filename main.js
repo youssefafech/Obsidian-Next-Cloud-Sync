@@ -213,6 +213,8 @@ var DEFAULT_SETTINGS = {
   checkRemoteOnOpen: true,
   checkRemoteOnFocus: true,
   focusCheckThrottleMs: 2e3,
+  periodicRemoteCheckEnabled: false,
+  periodicRemoteCheckMinutes: 15,
   promptRemoteDelete: true,
   applyRemoteDeletions: true,
   remoteDeletionsPath: ".sync-deletions.json",
@@ -254,6 +256,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
   deletionSyncInFlight = false;
   suppressDeletePrompt = /* @__PURE__ */ new Set();
   credentialKeyPromise = null;
+  periodicSyncTimer = null;
   async onload() {
     await this.loadPluginData();
     this.addSettingTab(new SyncSettingTab(this.app, this));
@@ -262,6 +265,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     this.seedStatusesFromState();
     this.applyStatusStyles();
     void this.syncRemoteDeletions("startup");
+    this.setupPeriodicRemoteCheck();
     this.registerEvent(
       this.app.vault.on("modify", (file) => this.onVaultModify(file))
     );
@@ -353,6 +357,42 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       window.clearTimeout(timer);
     }
     this.debounceTimers.clear();
+    if (this.periodicSyncTimer) {
+      window.clearInterval(this.periodicSyncTimer);
+      this.periodicSyncTimer = null;
+    }
+  }
+  setupPeriodicRemoteCheck() {
+    if (this.periodicSyncTimer) {
+      window.clearInterval(this.periodicSyncTimer);
+      this.periodicSyncTimer = null;
+    }
+    if (!this.settings.periodicRemoteCheckEnabled) return;
+    const rawMinutes = Number.isFinite(this.settings.periodicRemoteCheckMinutes) ? this.settings.periodicRemoteCheckMinutes : 15;
+    const minutes = Math.max(1, Math.floor(rawMinutes));
+    const intervalMs = minutes * 60 * 1e3;
+    this.periodicSyncTimer = window.setInterval(() => {
+      void this.runPeriodicRemoteCheck();
+    }, intervalMs);
+    this.logDebug(`Periodic remote check enabled (${minutes}m).`);
+  }
+  async runPeriodicRemoteCheck() {
+    if (!this.settings.username || !this.settings.appPassword || !this.settings.nextcloudBaseUrl) {
+      return;
+    }
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      if (!this.isFileInScope(file)) continue;
+      this.enqueueRemoteCheck(file.path, "periodic");
+    }
+    await this.syncRemoteDeletions("periodic");
+  }
+  isTasksPluginEnabled() {
+    const plugins = this.app?.plugins;
+    if (!plugins) return false;
+    const enabledSet = plugins.enabledPlugins;
+    if (enabledSet && !enabledSet.has("obsidian-tasks-plugin")) return false;
+    return Boolean(plugins.getPlugin?.("obsidian-tasks-plugin"));
   }
   isEncryptedCredential(value) {
     return Boolean(value) && value.startsWith(CREDENTIAL_PREFIX);
@@ -1384,8 +1424,9 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
     if (!client) return { content, changed: false };
     const calendarUrl = this.normalizeCalendarUrl(this.settings.taskListUrl);
     const remoteTasks = await this.fetchRemoteTasks(client, calendarUrl);
+    const useTasksPlugin = this.isTasksPluginEnabled();
     const lines = content.split(/\r?\n/);
-    const tasks = parseTaskLines(lines);
+    const tasks = parseTaskLines(lines, { useTasksPlugin });
     if (tasks.length === 0) return { content, changed: false };
     let changed = false;
     const seenUids = /* @__PURE__ */ new Set();
@@ -1395,9 +1436,18 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       const checked = task.checked;
       if (!uid) {
         uid = generateUid();
-        const newLine = `${task.prefix}${checked ? "[x]" : "[ ]"} ${summary} ${formatTaskUid(uid)}`.trimEnd();
+        const newLine = buildTaskLine({
+          prefix: task.prefix,
+          checked,
+          summary,
+          tags: task.tags,
+          meta: task.meta,
+          uid,
+          statusSymbol: task.statusSymbol,
+          useTasksPlugin
+        });
         lines[task.lineIndex] = newLine;
-        await this.createRemoteTask(client, calendarUrl, uid, summary, checked);
+        await this.createRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin);
         this.state.tasks[uid] = {
           uid,
           filePath: file.path,
@@ -1416,7 +1466,16 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
       const localChanged = !state || state.lastSyncedLine !== localLine;
       const remoteChanged = !!remote && (!!state?.lastRemoteModified || !!state?.lastRemoteEtag) && (state?.lastRemoteModified && remote.lastModified !== state.lastRemoteModified || state?.lastRemoteEtag && remote.etag !== state.lastRemoteEtag);
       if (remote && remoteChanged && !localChanged) {
-        const updatedLine = `${task.prefix}${remote.completed ? "[x]" : "[ ]"} ${remote.summary} ${formatTaskUid(uid)}`.trimEnd();
+        const updatedLine = buildTaskLine({
+          prefix: task.prefix,
+          checked: remote.completed,
+          summary: remote.summary,
+          tags: remote.categories,
+          meta: mapRemoteToTaskMeta(remote),
+          uid,
+          statusSymbol: task.statusSymbol,
+          useTasksPlugin
+        });
         lines[task.lineIndex] = updatedLine;
         changed = true;
         this.state.tasks[uid] = {
@@ -1429,7 +1488,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         continue;
       }
       if (!remote) {
-        await this.createRemoteTask(client, calendarUrl, uid, summary, checked);
+        await this.createRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin);
         this.state.tasks[uid] = {
           uid,
           filePath: file.path,
@@ -1443,7 +1502,7 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         if (remoteChanged) {
           new import_obsidian2.Notice(`Task conflict for ${uid}. Keeping local.`);
         }
-        await this.updateRemoteTask(client, calendarUrl, uid, summary, checked, remote.etag);
+        await this.updateRemoteTask(client, calendarUrl, uid, summary, checked, task, useTasksPlugin, remote.etag);
         this.state.tasks[uid] = {
           uid,
           filePath: file.path,
@@ -1506,22 +1565,31 @@ var SyncPlugin = class extends import_obsidian2.Plugin {
         completed: parsed.completed,
         lastModified: parsed.lastModified,
         etag,
-        href: href.startsWith("http") ? href : new URL(href, calendarUrl).toString()
+        href: href.startsWith("http") ? href : new URL(href, calendarUrl).toString(),
+        dueDate: parsed.dueDate,
+        startDate: parsed.startDate,
+        completedDate: parsed.completedDate,
+        status: parsed.status,
+        priority: parsed.priority,
+        percentComplete: parsed.percentComplete,
+        categories: parsed.categories,
+        description: parsed.description,
+        recurrenceRule: parsed.recurrenceRule
       });
     }
     return tasks;
   }
-  async createRemoteTask(client, calendarUrl, uid, summary, completed) {
+  async createRemoteTask(client, calendarUrl, uid, summary, completed, task, useTasksPlugin) {
     const url = `${calendarUrl.replace(/\/+$/, "/")}${uid}.ics`;
-    const body = buildVtodo(uid, summary, completed);
+    const body = buildVtodo(uid, summary, completed, task, useTasksPlugin);
     const response = await client.putAbsolute(url, body, { "If-None-Match": "*" });
     if (!response.ok) {
       throw await this.handleWebDavError(response, uid);
     }
   }
-  async updateRemoteTask(client, calendarUrl, uid, summary, completed, etag) {
+  async updateRemoteTask(client, calendarUrl, uid, summary, completed, task, useTasksPlugin, etag) {
     const url = `${calendarUrl.replace(/\/+$/, "/")}${uid}.ics`;
-    const body = buildVtodo(uid, summary, completed);
+    const body = buildVtodo(uid, summary, completed, task, useTasksPlugin);
     const headers = {};
     if (etag) {
       headers["If-Match"] = etag;
@@ -2039,6 +2107,21 @@ var SyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("Periodic remote check").setDesc("Check remote changes for all in-scope notes every N minutes").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.periodicRemoteCheckEnabled).onChange(async (value) => {
+        this.plugin.settings.periodicRemoteCheckEnabled = value;
+        await this.plugin.savePluginData();
+        this.plugin.setupPeriodicRemoteCheck();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Periodic check interval (minutes)").setDesc("How often to check for remote changes when periodic check is enabled").addText(
+      (text) => text.setPlaceholder("15").setValue(String(this.plugin.settings.periodicRemoteCheckMinutes)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        this.plugin.settings.periodicRemoteCheckMinutes = Number.isFinite(parsed) ? Math.max(1, parsed) : 15;
+        await this.plugin.savePluginData();
+        this.plugin.setupPeriodicRemoteCheck();
+      })
+    );
     new import_obsidian2.Setting(containerEl).setName("Focus check throttle (ms)").setDesc("Minimum delay between focus-triggered checks per file").addText(
       (text) => text.setPlaceholder("2000").setValue(String(this.plugin.settings.focusCheckThrottleMs)).onChange(async (value) => {
         const parsed = Number.parseInt(value, 10);
@@ -2516,15 +2599,17 @@ function safeJsonParse(value) {
     return null;
   }
 }
-function parseTaskLines(lines) {
+function parseTaskLines(lines, options) {
   const tasks = [];
-  const pattern = /^(\s*-\s+)\[( |x|X)\]\s+(.*)$/;
+  const pattern = /^(\s*-\s+)\[([^\]])\]\s+(.*)$/;
+  const useTasksPlugin = options?.useTasksPlugin ?? false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = line.match(pattern);
     if (!match) continue;
     const prefix = match[1];
-    const checked = match[2].toLowerCase() === "x";
+    const statusSymbol = match[2];
+    const checked = statusSymbol.toLowerCase() === "x";
     let summary = match[3].trim();
     let uid = null;
     const uidMatch = summary.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->$/);
@@ -2532,13 +2617,24 @@ function parseTaskLines(lines) {
       uid = uidMatch[1];
       summary = summary.replace(uidMatch[0], "").trim();
     }
+    let meta = emptyTaskMeta();
+    let tags = [];
+    if (useTasksPlugin) {
+      const parsed = parseTasksPluginTask(summary);
+      summary = parsed.summary;
+      tags = parsed.tags;
+      meta = parsed.meta;
+    }
     tasks.push({
       lineIndex: i,
       raw: line,
       checked,
       summary,
       uid,
-      prefix
+      prefix,
+      statusSymbol,
+      tags,
+      meta
     });
   }
   return tasks;
@@ -2554,11 +2650,25 @@ function generateUid() {
   const now = Date.now().toString(16);
   return `${now}-${random}`;
 }
-function buildVtodo(uid, summary, completed) {
+function buildVtodo(uid, summary, completed, task, useTasksPlugin) {
   const stamp = formatCalDate(/* @__PURE__ */ new Date());
-  const status = completed ? "COMPLETED" : "NEEDS-ACTION";
-  const completedLine = completed ? `COMPLETED:${stamp}\r
+  const meta = useTasksPlugin ? task.meta : emptyTaskMeta();
+  const status = meta.cancelledDate && !completed ? "CANCELLED" : completed ? "COMPLETED" : "NEEDS-ACTION";
+  const completedDate = completed ? meta.doneDate : null;
+  const completedLine = completed ? completedDate ? `COMPLETED;VALUE=DATE:${formatCalDateOnly(completedDate)}\r
+` : `COMPLETED:${stamp}\r
 ` : "";
+  const categories = useTasksPlugin ? normalizeTags(task.tags) : [];
+  const descriptionParts = [];
+  if (meta.scheduledDate) descriptionParts.push(`Scheduled: ${meta.scheduledDate}`);
+  if (meta.createdDate) descriptionParts.push(`Created: ${meta.createdDate}`);
+  if (meta.cancelledDate && status !== "CANCELLED") descriptionParts.push(`Cancelled: ${meta.cancelledDate}`);
+  const recurrenceRule = meta.recurrenceText?.trim() ?? "";
+  const hasRrule = recurrenceRule.toUpperCase().includes("FREQ=");
+  if (meta.recurrenceText && !hasRrule) {
+    descriptionParts.push(`Recurrence: ${meta.recurrenceText}`);
+  }
+  const descriptionLine = descriptionParts.length > 0 ? `DESCRIPTION:${escapeCalText(descriptionParts.join("\\n"))}` : "";
   return [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -2568,6 +2678,12 @@ function buildVtodo(uid, summary, completed) {
     `DTSTAMP:${stamp}`,
     `LAST-MODIFIED:${stamp}`,
     `SUMMARY:${escapeCalText(summary)}`,
+    meta.startDate ? `DTSTART;VALUE=DATE:${formatCalDateOnly(meta.startDate)}` : "",
+    meta.dueDate ? `DUE;VALUE=DATE:${formatCalDateOnly(meta.dueDate)}` : "",
+    meta.priority ? `PRIORITY:${meta.priority}` : "",
+    categories.length > 0 ? `CATEGORIES:${escapeCalText(categories.join(","))}` : "",
+    descriptionLine,
+    hasRrule ? `RRULE:${recurrenceRule.replace(/^RRULE:/i, "")}` : "",
     `STATUS:${status}`,
     completedLine.trimEnd(),
     "END:VTODO",
@@ -2582,6 +2698,14 @@ function parseVtodo(data) {
   let status = null;
   let completedValue = null;
   let lastModified = null;
+  let dueDate = null;
+  let startDate = null;
+  let completedDate = null;
+  let priority = null;
+  let percentComplete = null;
+  let categories = [];
+  let description = null;
+  let recurrenceRule = null;
   for (const line of lines) {
     if (line === "BEGIN:VTODO") {
       inTodo = true;
@@ -2594,17 +2718,174 @@ function parseVtodo(data) {
     if (!inTodo) continue;
     const [rawKey, ...rest] = line.split(":");
     if (!rawKey || rest.length === 0) continue;
-    const key = rawKey.split(";")[0].toUpperCase();
     const value = rest.join(":");
+    const parts = rawKey.split(";");
+    const key = parts[0].toUpperCase();
+    const params = parts.slice(1).map((param) => param.toUpperCase());
+    const isDateValue = params.includes("VALUE=DATE");
     if (key === "UID") uid = value.trim();
     if (key === "SUMMARY") summary = unescapeCalText(value.trim());
     if (key === "STATUS") status = value.trim().toUpperCase();
-    if (key === "COMPLETED") completedValue = value.trim();
+    if (key === "COMPLETED") {
+      completedValue = value.trim();
+      completedDate = parseCalDateValue(completedValue, isDateValue);
+    }
     if (key === "LAST-MODIFIED") lastModified = value.trim();
+    if (key === "DUE") dueDate = parseCalDateValue(value.trim(), isDateValue);
+    if (key === "DTSTART") startDate = parseCalDateValue(value.trim(), isDateValue);
+    if (key === "PRIORITY") {
+      const parsed = Number.parseInt(value.trim(), 10);
+      priority = Number.isFinite(parsed) ? parsed : null;
+    }
+    if (key === "PERCENT-COMPLETE") {
+      const parsed = Number.parseInt(value.trim(), 10);
+      percentComplete = Number.isFinite(parsed) ? parsed : null;
+    }
+    if (key === "CATEGORIES") {
+      const raw = unescapeCalText(value.trim());
+      categories = raw.split(",").map((item) => item.trim()).filter(Boolean);
+    }
+    if (key === "DESCRIPTION") description = unescapeCalText(value.trim());
+    if (key === "RRULE") recurrenceRule = value.trim();
   }
   if (!uid) return null;
-  const completed = status === "COMPLETED" || completedValue !== null;
-  return { uid, summary, completed, lastModified };
+  const completed = status === "COMPLETED" || completedValue !== null || percentComplete === 100;
+  return {
+    uid,
+    summary,
+    completed,
+    lastModified,
+    dueDate,
+    startDate,
+    completedDate,
+    status,
+    priority,
+    percentComplete,
+    categories,
+    description,
+    recurrenceRule
+  };
+}
+function emptyTaskMeta() {
+  return {
+    dueDate: null,
+    scheduledDate: null,
+    startDate: null,
+    createdDate: null,
+    doneDate: null,
+    cancelledDate: null,
+    priority: null,
+    recurrenceText: null
+  };
+}
+function normalizeTags(tags) {
+  return tags.map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith("#") ? tag.slice(1) : tag);
+}
+function parseTasksPluginTask(summary) {
+  let working = summary;
+  const tags = extractTags(working);
+  working = removeTags(working).trim();
+  const { cleaned, meta } = extractTasksPluginMeta(working);
+  return { summary: cleaned, tags, meta };
+}
+function extractTags(text) {
+  const tags = [];
+  const pattern = /(^|\s)(#[A-Za-z0-9/_-]+)/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    tags.push(match[2].slice(1));
+  }
+  return Array.from(new Set(tags));
+}
+function removeTags(text) {
+  return text.replace(/(^|\s)#[A-Za-z0-9/_-]+/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+function extractTasksPluginMeta(text) {
+  let cleaned = text;
+  const meta = emptyTaskMeta();
+  const dateFields = [
+    { emoji: "📅", key: "dueDate" },
+    { emoji: "⏳", key: "scheduledDate" },
+    { emoji: "🛫", key: "startDate" },
+    { emoji: "➕", key: "createdDate" },
+    { emoji: "✅", key: "doneDate" },
+    { emoji: "❌", key: "cancelledDate" }
+  ];
+  for (const field of dateFields) {
+    const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`);
+    const match = cleaned.match(regex);
+    if (match) {
+      meta[field.key] = match[1];
+      cleaned = cleaned.replace(match[0], " ").trim();
+    }
+  }
+  if (cleaned.includes("⏫")) {
+    meta.priority = 1;
+    cleaned = cleaned.replace("⏫", " ").trim();
+  } else if (cleaned.includes("🔼")) {
+    meta.priority = 3;
+    cleaned = cleaned.replace("🔼", " ").trim();
+  } else if (cleaned.includes("🔽")) {
+    meta.priority = 7;
+    cleaned = cleaned.replace("🔽", " ").trim();
+  } else if (cleaned.includes("⏬")) {
+    meta.priority = 9;
+    cleaned = cleaned.replace("⏬", " ").trim();
+  }
+  const recurrenceIndex = cleaned.indexOf("🔁");
+  if (recurrenceIndex !== -1) {
+    const tokenList = ["📅", "⏳", "🛫", "➕", "✅", "❌", "⏫", "🔼", "🔽", "⏬"];
+    let endIndex = cleaned.length;
+    for (const token of tokenList) {
+      const idx = cleaned.indexOf(token, recurrenceIndex + 2);
+      if (idx !== -1 && idx < endIndex) {
+        endIndex = idx;
+      }
+    }
+    const recurrenceText = cleaned.slice(recurrenceIndex + 2, endIndex).trim();
+    meta.recurrenceText = recurrenceText || null;
+    cleaned = cleaned.slice(0, recurrenceIndex).trim() + " " + cleaned.slice(endIndex).trim();
+  }
+  cleaned = cleaned.replace(/\s{2,}/g, " ").trim();
+  return { cleaned, meta };
+}
+function formatTaskMetaTokens(meta) {
+  const parts = [];
+  if (meta.priority) {
+    const emoji = meta.priority <= 1 ? "⏫" : meta.priority <= 3 ? "🔼" : meta.priority >= 9 ? "⏬" : "🔽";
+    parts.push(emoji);
+  }
+  if (meta.dueDate) parts.push(`📅 ${meta.dueDate}`);
+  if (meta.scheduledDate) parts.push(`⏳ ${meta.scheduledDate}`);
+  if (meta.startDate) parts.push(`🛫 ${meta.startDate}`);
+  if (meta.createdDate) parts.push(`➕ ${meta.createdDate}`);
+  if (meta.doneDate) parts.push(`✅ ${meta.doneDate}`);
+  if (meta.cancelledDate) parts.push(`❌ ${meta.cancelledDate}`);
+  if (meta.recurrenceText) parts.push(`🔁 ${meta.recurrenceText}`);
+  return parts.join(" ");
+}
+function buildTaskLine(options) {
+  const { prefix, checked, summary, tags, meta, uid, statusSymbol, useTasksPlugin } = options;
+  if (!useTasksPlugin) {
+    return `${prefix}${checked ? "[x]" : "[ ]"} ${summary} ${formatTaskUid(uid)}`.trimEnd();
+  }
+  const effectiveSymbol = checked ? "x" : statusSymbol === "x" || statusSymbol === "X" ? " " : statusSymbol;
+  const tagTokens = normalizeTags(tags).map((tag) => `#${tag}`).join(" ");
+  const metaTokens = formatTaskMetaTokens(meta);
+  const body = [summary, tagTokens, metaTokens].filter((part) => part && part.length > 0).join(" ").trim();
+  return `${prefix}[${effectiveSymbol}] ${body} ${formatTaskUid(uid)}`.trimEnd();
+}
+function mapRemoteToTaskMeta(remote) {
+  return {
+    dueDate: remote.dueDate,
+    scheduledDate: null,
+    startDate: remote.startDate,
+    createdDate: null,
+    doneDate: remote.completedDate,
+    cancelledDate: remote.status === "CANCELLED" ? remote.completedDate : null,
+    priority: remote.priority,
+    recurrenceText: remote.recurrenceRule
+  };
 }
 function unfoldIcalLines(data) {
   const raw = data.split(/\r?\n/);
@@ -2626,6 +2907,22 @@ function formatCalDate(date) {
   const min = String(date.getUTCMinutes()).padStart(2, "0");
   const ss = String(date.getUTCSeconds()).padStart(2, "0");
   return `${yyyy}${mm}${dd}T${hh}${min}${ss}Z`;
+}
+function formatCalDateOnly(value) {
+  if (!value) return formatCalDate(/* @__PURE__ */ new Date()).slice(0, 8);
+  return value.replace(/-/g, "");
+}
+function parseCalDateValue(value, isDateValue) {
+  if (!value) return null;
+  const raw = value.trim();
+  if (isDateValue || raw.length === 8) {
+    return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+  }
+  const datePart = raw.split("T")[0];
+  if (datePart.length === 8) {
+    return `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`;
+  }
+  return null;
 }
 function escapeCalText(value) {
   return value.replace(/\\\\/g, "\\\\\\\\").replace(/\\n/g, "\\\\n").replace(/,/g, "\\\\,").replace(/;/g, "\\\\;");
