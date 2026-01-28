@@ -1,8 +1,8 @@
 {
   "settings": {
-    "nextcloudBaseUrl": "enc:v1:9udcN/xdYaa0UWWO:eOmG8TZ+xdU7uYL96VWBhPEiybMFvIIJI+4IOug9tdjCIEkeEnn+HY0ZipU0iQ==",
-    "username": "enc:v1:ew7j9WKA3QlqXAgI:dWS8mQPX2IC5GLQSB4KFI68BUw==",
-    "appPassword": "enc:v1:P7OKeTLnE5YGhbxl:g3UCcdTgH9kase5J/4OD4XAdEviUboFV8r4bJCVR8NQYdiqlBr4R2CYhuI4T",
+    "nextcloudBaseUrl": "enc:v1:NtC5r30l3DGvnY9W:EhZu8qTObyTNekPb6xCStOSu8z6UjD/vlsZL8YUcmK3E1x1BfHqrZkSa5LcUYg==",
+    "username": "enc:v1:e9203+v7RnDxhkfv:WuRieT4TVLEzrJM/m/v8BxJhgQ==",
+    "appPassword": "enc:v1:mgYhHRCqsFweSUPQ:1eP112S6WMGY13sYtIZ5TqwVsRB+lIV+1IPSar42j8WEvgnE3eEj5lz2Ab4c",
     "remoteRoot": "Notes",
     "debounceMs": 900,
     "includePatterns": "**/*.md",
@@ -42,7 +42,7 @@
     "applyRemoteDeletions": true,
     "remoteDeletionsPath": ".sync-deletions.json",
     "enableTaskSync": true,
-    "taskListUrl": "enc:v1:ToIFrwYKE4LNnwMm:uybAE/CTFNFOJFExh7r3Y0h3IGCDzgn5drr5Jb9iC1T/w5+Y6Xny/XtB6/2I8MIiVZhUTsnVYSdD01w5YFsyHcN5tRjuyWFy1NyDwS4B9uhRt01D",
+    "taskListUrl": "enc:v1:4wKT46uIXzxN5WUr:nw6bpZHtTuUZM4i/0e3/e962oIj2DPkf5sQRh7XyiJFiqsBBlJw2iSKGs4VOS/nDSfIXHrIlBMoJ0BnjqJxXFtcC600XTpn12b79B8wbv9t7ApzO",
     "caldavBaseUrl": "",
     "taskSyncOnFileSync": true,
     "enableChangelog": true,
@@ -1986,9 +1986,18 @@
         "lastKnownLocalMtime": 1769555658501
       }
     },
-    "conflicts": {},
+    "conflicts": {
+      "Delaval/Problematic Implementation.md": {
+        "vaultPath": "Delaval/Problematic Implementation.md",
+        "conflictPath": "Delaval/Problematic Implementation (conflict 2026-01-28 1228).md",
+        "remotePath": "Notes/Delaval/Problematic Implementation.md",
+        "remoteEtag": "\"09fef656563b27c951c93d387cc318a1\"",
+        "timestamp": "2026-01-28T11:28:50.387Z"
+      }
+    },
     "deletionsApplied": {
-      "Work/Communication Framework.md": "2026-01-25T03:45:45.842Z"
+      "Work/Communication Framework.md": "2026-01-25T03:45:45.842Z",
+      "2 -Next In line (conflict 2026-01-27 2051).md": "2026-01-27T20:33:28.957Z"
     },
     "tasks": {
       "396989": {
@@ -3149,9 +3158,9 @@
       "314de49c-85a7-466b-be45-29fa98b368bd": {
         "uid": "314de49c-85a7-466b-be45-29fa98b368bd",
         "filePath": "Task Inbox.md",
-        "lastSyncedLine": "- [ ] 🆔 314de49c-85a7-466b-be45-29fa98b368bd https://delaval.atlassian.net/wiki/spaces/BSOL/pages/edit-v2/16713711738?draftShareId=80885319-496b-49e6-ad80-1ccf1b404fd8 Release Notes #doing 🔺 📅 2026-01-28",
-        "lastRemoteModified": "20260127T231651Z",
-        "lastRemoteEtag": "\"19e438fb8b2d7582f1cc411bc161ceb2\""
+        "lastSyncedLine": "- [ ] 🆔 314de49c-85a7-466b-be45-29fa98b368bd https://delaval.atlassian.net/wiki/spaces/BSOL/pages/edit-v2/16713711738?draftShareId=80885319-496b-49e6-ad80-1ccf1b404fd8 Release Notes 🔺 #doing 📅 2026-01-28",
+        "lastRemoteModified": "20260127T231723Z",
+        "lastRemoteEtag": "\"a0614549cec5dd0f48750f716cb2475b\""
       },
       "b2d298d5-931f-401b-adfc-56c5c99a7295": {
         "uid": "b2d298d5-931f-401b-adfc-56c5c99a7295",
@@ -3733,6 +3742,27 @@
         "lastSyncedLine": "- [ ] 🆔 4ca04a Review today",
         "lastRemoteModified": "20260127T231418Z",
         "lastRemoteEtag": "\"d4c2b095fe9965a723655a416f782ca6\""
+      },
+      "2cebcd79-89cf-4a65-972e-dba22bd110b5": {
+        "uid": "2cebcd79-89cf-4a65-972e-dba22bd110b5",
+        "filePath": "Task Inbox.md",
+        "lastSyncedLine": "- [x] 🆔 2cebcd79-89cf-4a65-972e-dba22bd110b5 Look at DPN 🔽 ✅ 2025-09-22 ✅ 2026-01-28",
+        "lastRemoteModified": "20260128T083237Z",
+        "lastRemoteEtag": "\"762ddcb7163333f41905e0112453c46f\""
+      },
+      "76b9eeb4-df42-48b4-8350-141db4ee0d4d": {
+        "uid": "76b9eeb4-df42-48b4-8350-141db4ee0d4d",
+        "filePath": "Task Inbox.md",
+        "lastSyncedLine": "- [ ] 🆔 76b9eeb4-df42-48b4-8350-141db4ee0d4d Development guide",
+        "lastRemoteModified": "20260128T083237Z",
+        "lastRemoteEtag": "\"4942b3822a97030cd2b1df3a41a68d8e\""
+      },
+      "adb33a": {
+        "uid": "adb33a",
+        "filePath": "Delaval/Problematic Implementation.md",
+        "lastSyncedLine": "\t- [x] 🆔 adb33a Ask about that DLV_ECO_PromoteAffItems ✅ 2026-01-27 #lars_lagerstrom ✅ 2026-01-13",
+        "lastRemoteModified": null,
+        "lastRemoteEtag": null
       }
     },
     "noSync": {

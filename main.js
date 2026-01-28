@@ -265,6 +265,21 @@ var WebDavClient = class {
 };
 
 // main.ts
+var EMOJI = {
+  due: "\u{1F4C5}",
+  scheduled: "\u23F3",
+  start: "\u{1F6EB}",
+  created: "\u2795",
+  done: "\u2705",
+  cancelled: "\u274C",
+  recur: "\u{1F501}",
+  high: "\u23EB",
+  medium: "\u{1F53C}",
+  low: "\u{1F53D}",
+  lowest: "\u23EC",
+  time: "\u{1F552}",
+  id: "\u{1F194}"
+};
 var DEFAULT_SETTINGS = {
   nextcloudBaseUrl: "https://your-nextcloud.example.com",
   username: "",
@@ -960,10 +975,11 @@ ${this.settings.dailyChecklistTemplate.trim()}
     let line = lines[lineIndex] ?? "";
     if (!isTaskLine(line)) return;
     const tomorrow = formatDateOnly(new Date(Date.now() + 864e5));
-    if (line.match(/📅\s*\d{4}-\d{2}-\d{2}/)) {
-      line = line.replace(/📅\s*\d{4}-\d{2}-\d{2}/, `\u{1F4C5} ${tomorrow}`);
+    const dueRegex = new RegExp(`${EMOJI.due}\\s*\\d{4}-\\d{2}-\\d{2}`, "u");
+    if (line.match(dueRegex)) {
+      line = line.replace(dueRegex, `${EMOJI.due} ${tomorrow}`);
     } else {
-      line = `${line} \u{1F4C5} ${tomorrow}`.trimEnd();
+      line = `${line} ${EMOJI.due} ${tomorrow}`.trimEnd();
     }
     lines[lineIndex] = line;
     await this.writeFileLines(file, lines);
@@ -976,10 +992,11 @@ ${this.settings.dailyChecklistTemplate.trim()}
     if (!isTaskLine(line)) return;
     const value = window.prompt("Time block (e.g., 10:00-11:00):");
     if (!value || !value.trim()) return;
-    if (line.match(/🕒\s*[^\s]+/)) {
-      line = line.replace(/🕒\s*[^\s]+/, `\u{1F552} ${value.trim()}`);
+    const timeRegex = new RegExp(`${EMOJI.time}\\s*[^\\s]+`, "u");
+    if (line.match(timeRegex)) {
+      line = line.replace(timeRegex, `${EMOJI.time} ${value.trim()}`);
     } else {
-      line = `${line} \u{1F552} ${value.trim()}`.trimEnd();
+      line = `${line} ${EMOJI.time} ${value.trim()}`.trimEnd();
     }
     lines[lineIndex] = line;
     await this.writeFileLines(file, lines);
@@ -3583,7 +3600,7 @@ ${entry}`);
       const listItems = Array.from(el.querySelectorAll("li"));
       for (const li of listItems) {
         if (touched.has(li)) continue;
-        if (!li.textContent?.includes("\u{1F194}")) continue;
+        if (!li.textContent?.includes(EMOJI.id)) continue;
         touched.add(li);
         let icon = li.querySelector(".nc-task-synced-icon");
         if (!icon) {
@@ -4489,10 +4506,11 @@ function parseTaskLines(lines, options) {
     const checked = statusSymbol.toLowerCase() === "x";
     let summary = match[3].trim();
     let uid = null;
-    const uidMatch = summary.match(/^🆔\s*([A-Za-z0-9-]+)\s*/);
+    const uidRegex = new RegExp(`^${EMOJI.id}\\s*([A-Za-z0-9-]+)\\s*`, "u");
+    const uidMatch = summary.match(uidRegex);
     if (uidMatch) {
       uid = uidMatch[1];
-      summary = summary.replace(/^🆔\s*[A-Za-z0-9-]+\s*/, "").trim();
+      summary = summary.replace(uidRegex, "").trim();
     } else {
       const legacyMatch = summary.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->/);
       if (legacyMatch) {
@@ -4523,10 +4541,14 @@ function parseTaskLines(lines, options) {
   return tasks;
 }
 function stripTaskUid(value) {
-  return value.replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ").trim();
+  const id = EMOJI.id;
+  const idRegex = new RegExp(`\\s*${id}\\s*[A-Za-z0-9-]+\\s*`, "gu");
+  return value.replace(idRegex, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ").trim();
 }
 function stripTaskUidKeepWhitespace(value) {
-  return value.replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ");
+  const id = EMOJI.id;
+  const idRegex = new RegExp(`\\s*${id}\\s*[A-Za-z0-9-]+\\s*`, "gu");
+  return value.replace(idRegex, " ").replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ");
 }
 function normalizeTaskKey(summary, completed) {
   const normalized = summary.trim().toLowerCase().replace(/\s+/g, " ");
@@ -4590,7 +4612,7 @@ function popRemoteMatch(index, summary, completed) {
   return bucket.shift() ?? null;
 }
 function formatTaskUid(uid) {
-  return `\u{1F194} ${uid}`;
+  return `${EMOJI.id} ${uid}`;
 }
 function generateUid() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -4754,37 +4776,48 @@ function extractTasksPluginMeta(text) {
   let cleaned = text;
   const meta = emptyTaskMeta();
   const dateFields = [
-    { emoji: "\u{1F4C5}", key: "dueDate" },
-    { emoji: "\u23F3", key: "scheduledDate" },
-    { emoji: "\u{1F6EB}", key: "startDate" },
-    { emoji: "\u2795", key: "createdDate" },
-    { emoji: "\u2705", key: "doneDate" },
-    { emoji: "\u274C", key: "cancelledDate" }
+    { emoji: EMOJI.due, key: "dueDate" },
+    { emoji: EMOJI.scheduled, key: "scheduledDate" },
+    { emoji: EMOJI.start, key: "startDate" },
+    { emoji: EMOJI.created, key: "createdDate" },
+    { emoji: EMOJI.done, key: "doneDate" },
+    { emoji: EMOJI.cancelled, key: "cancelledDate" }
   ];
   for (const field of dateFields) {
-    const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`);
+    const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`, "u");
     const match = cleaned.match(regex);
     if (match) {
       meta[field.key] = match[1];
       cleaned = cleaned.replace(match[0], " ").trim();
     }
   }
-  if (cleaned.includes("\u23EB")) {
+  if (cleaned.includes(EMOJI.high)) {
     meta.priority = 1;
-    cleaned = cleaned.replace("\u23EB", " ").trim();
-  } else if (cleaned.includes("\u{1F53C}")) {
+    cleaned = cleaned.replace(EMOJI.high, " ").trim();
+  } else if (cleaned.includes(EMOJI.medium)) {
     meta.priority = 3;
-    cleaned = cleaned.replace("\u{1F53C}", " ").trim();
-  } else if (cleaned.includes("\u{1F53D}")) {
+    cleaned = cleaned.replace(EMOJI.medium, " ").trim();
+  } else if (cleaned.includes(EMOJI.low)) {
     meta.priority = 7;
-    cleaned = cleaned.replace("\u{1F53D}", " ").trim();
-  } else if (cleaned.includes("\u23EC")) {
+    cleaned = cleaned.replace(EMOJI.low, " ").trim();
+  } else if (cleaned.includes(EMOJI.lowest)) {
     meta.priority = 9;
-    cleaned = cleaned.replace("\u23EC", " ").trim();
+    cleaned = cleaned.replace(EMOJI.lowest, " ").trim();
   }
-  const recurrenceIndex = cleaned.indexOf("\u{1F501}");
+  const recurrenceIndex = cleaned.indexOf(EMOJI.recur);
   if (recurrenceIndex !== -1) {
-    const tokenList = ["\u{1F4C5}", "\u23F3", "\u{1F6EB}", "\u2795", "\u2705", "\u274C", "\u23EB", "\u{1F53C}", "\u{1F53D}", "\u23EC"];
+    const tokenList = [
+      EMOJI.due,
+      EMOJI.scheduled,
+      EMOJI.start,
+      EMOJI.created,
+      EMOJI.done,
+      EMOJI.cancelled,
+      EMOJI.high,
+      EMOJI.medium,
+      EMOJI.low,
+      EMOJI.lowest
+    ];
     let endIndex = cleaned.length;
     for (const token of tokenList) {
       const idx = cleaned.indexOf(token, recurrenceIndex + 2);
@@ -4802,16 +4835,16 @@ function extractTasksPluginMeta(text) {
 function formatTaskMetaTokens(meta) {
   const parts = [];
   if (meta.priority) {
-    const emoji = meta.priority <= 1 ? "\u23EB" : meta.priority <= 3 ? "\u{1F53C}" : meta.priority >= 9 ? "\u23EC" : "\u{1F53D}";
+    const emoji = meta.priority <= 1 ? EMOJI.high : meta.priority <= 3 ? EMOJI.medium : meta.priority >= 9 ? EMOJI.lowest : EMOJI.low;
     parts.push(emoji);
   }
-  if (meta.dueDate) parts.push(`\u{1F4C5} ${meta.dueDate}`);
-  if (meta.scheduledDate) parts.push(`\u23F3 ${meta.scheduledDate}`);
-  if (meta.startDate) parts.push(`\u{1F6EB} ${meta.startDate}`);
-  if (meta.createdDate) parts.push(`\u2795 ${meta.createdDate}`);
-  if (meta.doneDate) parts.push(`\u2705 ${meta.doneDate}`);
-  if (meta.cancelledDate) parts.push(`\u274C ${meta.cancelledDate}`);
-  if (meta.recurrenceText) parts.push(`\u{1F501} ${meta.recurrenceText}`);
+  if (meta.dueDate) parts.push(`${EMOJI.due} ${meta.dueDate}`);
+  if (meta.scheduledDate) parts.push(`${EMOJI.scheduled} ${meta.scheduledDate}`);
+  if (meta.startDate) parts.push(`${EMOJI.start} ${meta.startDate}`);
+  if (meta.createdDate) parts.push(`${EMOJI.created} ${meta.createdDate}`);
+  if (meta.doneDate) parts.push(`${EMOJI.done} ${meta.doneDate}`);
+  if (meta.cancelledDate) parts.push(`${EMOJI.cancelled} ${meta.cancelledDate}`);
+  if (meta.recurrenceText) parts.push(`${EMOJI.recur} ${meta.recurrenceText}`);
   return parts.join(" ");
 }
 function buildTaskLine(options) {

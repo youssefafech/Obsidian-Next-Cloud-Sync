@@ -165,6 +165,22 @@ type QuickCaptureResult = {
   statusSymbol: string;
 };
 
+const EMOJI = {
+  due: "\u{1F4C5}",
+  scheduled: "\u23F3",
+  start: "\u{1F6EB}",
+  created: "\u2795",
+  done: "\u2705",
+  cancelled: "\u274C",
+  recur: "\u{1F501}",
+  high: "\u23EB",
+  medium: "\u{1F53C}",
+  low: "\u{1F53D}",
+  lowest: "\u23EC",
+  time: "\u{1F552}",
+  id: "\u{1F194}",
+};
+
 type TaskRemoteEntry = {
   uid: string;
   summary: string;
@@ -950,10 +966,11 @@ export default class SyncPlugin extends Plugin {
     let line = lines[lineIndex] ?? "";
     if (!isTaskLine(line)) return;
     const tomorrow = formatDateOnly(new Date(Date.now() + 86400000));
-    if (line.match(/📅\s*\d{4}-\d{2}-\d{2}/)) {
-      line = line.replace(/📅\s*\d{4}-\d{2}-\d{2}/, `📅 ${tomorrow}`);
+    const dueRegex = new RegExp(`${EMOJI.due}\\s*\\d{4}-\\d{2}-\\d{2}`, "u");
+    if (line.match(dueRegex)) {
+      line = line.replace(dueRegex, `${EMOJI.due} ${tomorrow}`);
     } else {
-      line = `${line} 📅 ${tomorrow}`.trimEnd();
+      line = `${line} ${EMOJI.due} ${tomorrow}`.trimEnd();
     }
     lines[lineIndex] = line;
     await this.writeFileLines(file, lines);
@@ -967,10 +984,11 @@ export default class SyncPlugin extends Plugin {
     if (!isTaskLine(line)) return;
     const value = window.prompt("Time block (e.g., 10:00-11:00):");
     if (!value || !value.trim()) return;
-    if (line.match(/🕒\s*[^\s]+/)) {
-      line = line.replace(/🕒\s*[^\s]+/, `🕒 ${value.trim()}`);
+    const timeRegex = new RegExp(`${EMOJI.time}\\s*[^\\s]+`, "u");
+    if (line.match(timeRegex)) {
+      line = line.replace(timeRegex, `${EMOJI.time} ${value.trim()}`);
     } else {
-      line = `${line} 🕒 ${value.trim()}`.trimEnd();
+      line = `${line} ${EMOJI.time} ${value.trim()}`.trimEnd();
     }
     lines[lineIndex] = line;
     await this.writeFileLines(file, lines);
@@ -3886,7 +3904,7 @@ export default class SyncPlugin extends Plugin {
       const listItems = Array.from(el.querySelectorAll("li"));
       for (const li of listItems) {
         if (touched.has(li)) continue;
-        if (!li.textContent?.includes("🆔")) continue;
+        if (!li.textContent?.includes(EMOJI.id)) continue;
         touched.add(li);
 
         let icon = li.querySelector<HTMLElement>(".nc-task-synced-icon");
@@ -5218,10 +5236,11 @@ function parseTaskLines(lines: string[], options?: { useTasksPlugin?: boolean })
     const checked = statusSymbol.toLowerCase() === "x";
     let summary = match[3].trim();
     let uid: string | null = null;
-    const uidMatch = summary.match(/^🆔\s*([A-Za-z0-9-]+)\s*/);
+    const uidRegex = new RegExp(`^${EMOJI.id}\\s*([A-Za-z0-9-]+)\\s*`, "u");
+    const uidMatch = summary.match(uidRegex);
     if (uidMatch) {
       uid = uidMatch[1];
-      summary = summary.replace(/^🆔\s*[A-Za-z0-9-]+\s*/, "").trim();
+      summary = summary.replace(uidRegex, "").trim();
     } else {
       const legacyMatch = summary.match(/<!--\s*nc-task:([A-Za-z0-9-]+)\s*-->/);
       if (legacyMatch) {
@@ -5253,15 +5272,19 @@ function parseTaskLines(lines: string[], options?: { useTasksPlugin?: boolean })
 }
 
 function stripTaskUid(value: string): string {
+  const id = EMOJI.id;
+  const idRegex = new RegExp(`\\s*${id}\\s*[A-Za-z0-9-]+\\s*`, "gu");
   return value
-    .replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ")
+    .replace(idRegex, " ")
     .replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ")
     .trim();
 }
 
 function stripTaskUidKeepWhitespace(value: string): string {
+  const id = EMOJI.id;
+  const idRegex = new RegExp(`\\s*${id}\\s*[A-Za-z0-9-]+\\s*`, "gu");
   return value
-    .replace(/\s*🆔\s*[A-Za-z0-9-]+\s*/g, " ")
+    .replace(idRegex, " ")
     .replace(/\s*<!--\s*nc-task:[A-Za-z0-9-]+\s*-->\s*/g, " ");
 }
 
@@ -5352,7 +5375,7 @@ function popRemoteMatch(
 }
 
 function formatTaskUid(uid: string): string {
-  return `🆔 ${uid}`;
+  return `${EMOJI.id} ${uid}`;
 }
 
 function generateUid(): string {
@@ -5551,15 +5574,15 @@ function extractTasksPluginMeta(text: string): { cleaned: string; meta: TaskLine
   const meta = emptyTaskMeta();
 
   const dateFields: Array<{ emoji: string; key: keyof TaskLineMeta }> = [
-    { emoji: "📅", key: "dueDate" },
-    { emoji: "⏳", key: "scheduledDate" },
-    { emoji: "🛫", key: "startDate" },
-    { emoji: "➕", key: "createdDate" },
-    { emoji: "✅", key: "doneDate" },
-    { emoji: "❌", key: "cancelledDate" },
+    { emoji: EMOJI.due, key: "dueDate" },
+    { emoji: EMOJI.scheduled, key: "scheduledDate" },
+    { emoji: EMOJI.start, key: "startDate" },
+    { emoji: EMOJI.created, key: "createdDate" },
+    { emoji: EMOJI.done, key: "doneDate" },
+    { emoji: EMOJI.cancelled, key: "cancelledDate" },
   ];
   for (const field of dateFields) {
-    const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`);
+    const regex = new RegExp(`${field.emoji}\\s*(\\d{4}-\\d{2}-\\d{2})`, "u");
     const match = cleaned.match(regex);
     if (match) {
       meta[field.key] = match[1];
@@ -5567,23 +5590,34 @@ function extractTasksPluginMeta(text: string): { cleaned: string; meta: TaskLine
     }
   }
 
-  if (cleaned.includes("⏫")) {
+  if (cleaned.includes(EMOJI.high)) {
     meta.priority = 1;
-    cleaned = cleaned.replace("⏫", " ").trim();
-  } else if (cleaned.includes("🔼")) {
+    cleaned = cleaned.replace(EMOJI.high, " ").trim();
+  } else if (cleaned.includes(EMOJI.medium)) {
     meta.priority = 3;
-    cleaned = cleaned.replace("🔼", " ").trim();
-  } else if (cleaned.includes("🔽")) {
+    cleaned = cleaned.replace(EMOJI.medium, " ").trim();
+  } else if (cleaned.includes(EMOJI.low)) {
     meta.priority = 7;
-    cleaned = cleaned.replace("🔽", " ").trim();
-  } else if (cleaned.includes("⏬")) {
+    cleaned = cleaned.replace(EMOJI.low, " ").trim();
+  } else if (cleaned.includes(EMOJI.lowest)) {
     meta.priority = 9;
-    cleaned = cleaned.replace("⏬", " ").trim();
+    cleaned = cleaned.replace(EMOJI.lowest, " ").trim();
   }
 
-  const recurrenceIndex = cleaned.indexOf("🔁");
+  const recurrenceIndex = cleaned.indexOf(EMOJI.recur);
   if (recurrenceIndex !== -1) {
-    const tokenList = ["📅", "⏳", "🛫", "➕", "✅", "❌", "⏫", "🔼", "🔽", "⏬"];
+    const tokenList = [
+      EMOJI.due,
+      EMOJI.scheduled,
+      EMOJI.start,
+      EMOJI.created,
+      EMOJI.done,
+      EMOJI.cancelled,
+      EMOJI.high,
+      EMOJI.medium,
+      EMOJI.low,
+      EMOJI.lowest,
+    ];
     let endIndex = cleaned.length;
     for (const token of tokenList) {
       const idx = cleaned.indexOf(token, recurrenceIndex + 2);
@@ -5606,16 +5640,23 @@ function extractTasksPluginMeta(text: string): { cleaned: string; meta: TaskLine
 function formatTaskMetaTokens(meta: TaskLineMeta): string {
   const parts: string[] = [];
   if (meta.priority) {
-    const emoji = meta.priority <= 1 ? "⏫" : meta.priority <= 3 ? "🔼" : meta.priority >= 9 ? "⏬" : "🔽";
+    const emoji =
+      meta.priority <= 1
+        ? EMOJI.high
+        : meta.priority <= 3
+          ? EMOJI.medium
+          : meta.priority >= 9
+            ? EMOJI.lowest
+            : EMOJI.low;
     parts.push(emoji);
   }
-  if (meta.dueDate) parts.push(`📅 ${meta.dueDate}`);
-  if (meta.scheduledDate) parts.push(`⏳ ${meta.scheduledDate}`);
-  if (meta.startDate) parts.push(`🛫 ${meta.startDate}`);
-  if (meta.createdDate) parts.push(`➕ ${meta.createdDate}`);
-  if (meta.doneDate) parts.push(`✅ ${meta.doneDate}`);
-  if (meta.cancelledDate) parts.push(`❌ ${meta.cancelledDate}`);
-  if (meta.recurrenceText) parts.push(`🔁 ${meta.recurrenceText}`);
+  if (meta.dueDate) parts.push(`${EMOJI.due} ${meta.dueDate}`);
+  if (meta.scheduledDate) parts.push(`${EMOJI.scheduled} ${meta.scheduledDate}`);
+  if (meta.startDate) parts.push(`${EMOJI.start} ${meta.startDate}`);
+  if (meta.createdDate) parts.push(`${EMOJI.created} ${meta.createdDate}`);
+  if (meta.doneDate) parts.push(`${EMOJI.done} ${meta.doneDate}`);
+  if (meta.cancelledDate) parts.push(`${EMOJI.cancelled} ${meta.cancelledDate}`);
+  if (meta.recurrenceText) parts.push(`${EMOJI.recur} ${meta.recurrenceText}`);
   return parts.join(" ");
 }
 
